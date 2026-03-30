@@ -10,9 +10,7 @@
 
 # Clone repo to get stimuli and lib.py
 import os
-if not os.path.exists('/content/demo'):
-# COLAB:     !git clone https://github.com/elliott-leow/clin_syco_demo.git /content/demo
-os.chdir('/content/demo')
+# Local: already in the right directory
 
 # ---
 # ## Setup
@@ -22,9 +20,14 @@ os.chdir('/content/demo')
 # COLAB: !pip install -q transformers accelerate numpy scikit-learn matplotlib tqdm
 
 import gc, json, os, time, shutil
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.makedirs('plots', exist_ok=True)
 import numpy as np
 import torch
 import torch.nn.functional as F
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from sklearn.linear_model import LogisticRegression
@@ -110,13 +113,13 @@ for s in stim_factual[:3]:
 # This is the primary model: the DPO-trained version, which is the most sycophantic of the three checkpoints (base, SFT, DPO). We load in fp16 with sdpa attention for efficiency.
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-MODEL_DPO = 'allenai/Olmo-3-7B-Instruct-DPO'
+MODEL_DPO = 'allenai/OLMo-2-0425-1B-Instruct'
 
-print(f'Loading {MODEL_DPO} (fp16)...')
+print(f'Loading {MODEL_DPO}...')
 t0 = time.time()
 model = AutoModelForCausalLM.from_pretrained(
-    MODEL_DPO, torch_dtype=torch.float16,
-    device_map='auto', attn_implementation='sdpa'
+    MODEL_DPO, torch_dtype=torch.float32,
+    attn_implementation='eager', low_cpu_mem_usage=True
 )
 model.eval()
 tokenizer = AutoTokenizer.from_pretrained(MODEL_DPO)
@@ -131,21 +134,23 @@ print(f'Loaded in {time.time() - t0:.0f}s')
 print(f'Layers: {N_LAYERS} total, sampling {len(LAYERS)}: {LAYERS}')
 print(f'VRAM: {vram():.1f} GB')
 
-# Behavioral validation: does the model actually produce sycophantic outputs?
-print('\nBehavioral sycophancy check (does model prefer sycophantic first token?):')
-syc_count = 0
-for s in stim_clinical[:30]:
+# Behavioral examples: what does the model actually say?
+# We generate greedy responses to a few clinical stimuli so the reader
+# can see whether the model validates or challenges the distortion.
+print('\nBehavioral examples (greedy generation):')
+print('=' * 70)
+for s in stim_clinical[:3]:
     prompt = format_prompt(tokenizer, s['user_prompt'])
     ids = tokenizer.encode(prompt, return_tensors='pt').to(get_device(model))
-    ther_tok = tokenizer.encode(s['therapeutic_completion'], add_special_tokens=False)[0]
-    syc_tok = tokenizer.encode(s['sycophantic_completion'], add_special_tokens=False)[0]
     with torch.no_grad():
-        logits = model(ids).logits[0, -1, :]
-    lp = F.log_softmax(logits.float(), dim=-1)
-    if lp[syc_tok] > lp[ther_tok]:
-        syc_count += 1
-print(f'  Clinical sycophancy rate: {syc_count}/30 = {syc_count/30:.0%}')
-print(f'  (model must be >50% sycophantic for the direction to reflect production behavior)')
+        out = model.generate(ids, attention_mask=torch.ones_like(ids),
+                             max_new_tokens=80, do_sample=False,
+                             pad_token_id=tokenizer.eos_token_id)
+    response = tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
+    print(f'\n[{s["subcategory"]}]')
+    print(f'  USER: {s["user_prompt"][:120]}...')
+    print(f'  MODEL: {response[:250]}')
+print('=' * 70)
 
 
 # ---
@@ -158,7 +163,7 @@ print(f'  (model must be >50% sycophantic for the direction to reflect productio
 # We also train a linear probe on one domain and test it on the other. Asymmetric transfer (factual-to-clinical works but not vice versa) would mean clinical sycophancy contains dimensions that factual sycophancy doesn't.
 
 # Use N_TRAIN items from each domain for direction computation
-N_TRAIN = 50  # train/test split: 50/50
+N_TRAIN = 10  # reduced for 1B model on CPU
 
 print('Extracting clinical activations...')
 clin_pos, clin_neg = batch_extract_contrastive(
@@ -222,7 +227,12 @@ for cos_dict, c, lab in [
     ax1.plot(x, [cos_dict[l] for l in x], '-', color=c, label=lab, lw=1.5)
 
 ax1.axhline(1.0, color='gray', ls=':', alpha=0.4)
-ax1.set(xlabel='Layer', ylabel='Cosine similarity', ylim=(0, 1.05))
+ax1.axhline(0.0, color='gray', ls=':', alpha=0.4)
+all_cos_vals = ([cos_clin_fact[l] for l in cos_clin_fact]
+                + [cos_bridge_fact[l] for l in cos_bridge_fact]
+                + [cos_clin_bridge[l] for l in cos_clin_bridge])
+y_lo = min(min(all_cos_vals) - 0.05, -0.1)
+ax1.set(xlabel='Layer', ylabel='Cosine similarity', ylim=(y_lo, 1.05))
 ax1.set_title('Direction similarity across layers')
 ax1.legend(fontsize=8)
 
@@ -239,7 +249,7 @@ ax2.set_title('Cross-domain probe transfer')
 ax2.legend(fontsize=8)
 
 fig.tight_layout()
-plt.show()
+plt.savefig(f"plots/fig{1}.png", dpi=150, bbox_inches="tight"); plt.close()
 
 # Print summary
 mean_cos = np.mean([cos_clin_fact[l] for l in cos_clin_fact])
@@ -250,8 +260,17 @@ print(f'Mean cosine (clinical vs factual): {mean_cos:.3f}')
 print(f'Mean AUC factual->clinical:        {mean_auc_f2c:.3f}')
 print(f'Mean accuracy clinical->factual:   {mean_acc_c2f:.3f}')
 print()
-print('Interpretation: The factual probe transfers well to clinical data (shared subspace),')
-print('but the clinical probe fails on factual data. Clinical sycophancy has extra dimensions.')
+if mean_auc_f2c > 0.6 and mean_acc_c2f < 0.6:
+    print('Interpretation: The factual probe transfers well to clinical data (shared subspace),')
+    print('but the clinical probe fails on factual data. Clinical sycophancy has extra dimensions.')
+elif mean_auc_f2c < 0.5 and mean_acc_c2f < 0.6:
+    print('Interpretation: Neither probe transfers well across domains (AUC < 0.5 means')
+    print('the factual direction is anti-correlated with clinical). The two sycophancy types')
+    print('occupy distinct — possibly opposing — representational subspaces.')
+else:
+    print(f'Interpretation: Cross-domain transfer is mixed (F->C AUC={mean_auc_f2c:.2f}, '
+          f'C->F acc={mean_acc_c2f:.2f}).')
+    print('The relationship between clinical and factual sycophancy directions is not clear-cut.')
 
 # ---
 # ## Hypothesis 3: Does preference optimization conflate empathy and sycophancy?
@@ -270,9 +289,9 @@ del model
 cleanup()
 
 CHECKPOINTS = {
-    'base': 'allenai/Olmo-3-1025-7B',
-    'sft': 'allenai/Olmo-3-7B-Instruct-SFT',
-    'dpo': 'allenai/Olmo-3-7B-Instruct-DPO',
+    'base': 'allenai/OLMo-2-0425-1B',
+    'sft': 'allenai/OLMo-2-0425-1B-SFT',
+    'instruct': 'allenai/OLMo-2-0425-1B-Instruct',
 }
 
 # Use clinical stimuli that have both therapeutic and sycophantic completions
@@ -288,8 +307,8 @@ for stage, model_id in CHECKPOINTS.items():
     t0 = time.time()
 
     mdl = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=torch.float16,
-        device_map='auto', attn_implementation='sdpa'
+        model_id, torch_dtype=torch.float32,
+        attn_implementation='eager', low_cpu_mem_usage=True
     )
     mdl.eval()
     tok = AutoTokenizer.from_pretrained(model_id)
@@ -328,8 +347,9 @@ for stage, model_id in CHECKPOINTS.items():
 
 print('\nAll checkpoints processed.')
 
-stages = ['base', 'sft', 'dpo']
-stage_colors = [GREEN, ORANGE, RED]
+stages = list(CHECKPOINTS.keys())
+_default_colors = [GREEN, ORANGE, RED, PURPLE, BLUE]
+stage_colors = _default_colors[:len(stages)]
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
 
@@ -351,21 +371,22 @@ for i, (stage, c) in enumerate(zip(stages, stage_colors)):
                  yerr=[[ci['mean'] - ci['ci_lo']], [ci['ci_hi'] - ci['mean']]],
                  fmt='none', color='black', capsize=6, lw=1.5)
 
-ax2.set_xticks(range(3))
-ax2.set_xticklabels(['Base', 'SFT', 'DPO'])
+ax2.set_xticks(range(len(stages)))
+ax2.set_xticklabels([s.upper() for s in stages])
 ax2.set(ylabel='Mean cosine similarity')
 ax2.set_title('Training stage (95% bootstrap CI)')
 
 fig.tight_layout()
-plt.show()
+plt.savefig(f"plots/fig{2}.png", dpi=150, bbox_inches="tight"); plt.close()
 
 print('Bootstrap CIs:')
 for stage in stages:
     ci = bootstrap_ci(h2_results[stage]['all_cosines'])
     print(f'  {stage:>4}: {ci["mean"]:.3f} [{ci["ci_lo"]:.3f}, {ci["ci_hi"]:.3f}]')
 
-total_shift = h2_results['dpo']['mean_cosine'] - h2_results['base']['mean_cosine']
-print(f'\nTotal shift (base -> DPO): {total_shift:+.3f}')
+last_stage = stages[-1]
+total_shift = h2_results[last_stage]['mean_cosine'] - h2_results['base']['mean_cosine']
+print(f'\nTotal shift (base -> {last_stage}): {total_shift:+.3f}')
 
 # ---
 # ## Reload DPO model for remaining experiments
@@ -376,8 +397,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 print(f'Reloading {MODEL_DPO}...')
 t0 = time.time()
 model = AutoModelForCausalLM.from_pretrained(
-    MODEL_DPO, torch_dtype=torch.float16,
-    device_map='auto', attn_implementation='sdpa'
+    MODEL_DPO, torch_dtype=torch.float32,
+    attn_implementation='eager', low_cpu_mem_usage=True
 )
 model.eval()
 tokenizer = AutoTokenizer.from_pretrained(MODEL_DPO)
@@ -385,7 +406,7 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 print(f'Loaded in {time.time() - t0:.0f}s, VRAM: {vram():.1f} GB')
 
-# Re-extract clinical and factual directions (lost when we freed the model)
+# Re-extract clinical and factual directions (lost when we freed the model) (lost when we freed the model)
 # We already have the act lists from H1 if they survived, but let's be safe
 # and reuse them if still in memory, otherwise re-extract
 try:
@@ -413,22 +434,6 @@ except:
     dir_bridge = compute_contrastive_direction(bridge_pos, bridge_neg)
     cleanup()
 
-# Behavioral validation: does the model actually produce sycophantic outputs?
-print('\nBehavioral sycophancy check (does model prefer sycophantic first token?):')
-syc_count = 0
-for s in stim_clinical[:30]:
-    prompt = format_prompt(tokenizer, s['user_prompt'])
-    ids = tokenizer.encode(prompt, return_tensors='pt').to(get_device(model))
-    ther_tok = tokenizer.encode(s['therapeutic_completion'], add_special_tokens=False)[0]
-    syc_tok = tokenizer.encode(s['sycophantic_completion'], add_special_tokens=False)[0]
-    with torch.no_grad():
-        logits = model(ids).logits[0, -1, :]
-    lp = F.log_softmax(logits.float(), dim=-1)
-    if lp[syc_tok] > lp[ther_tok]:
-        syc_count += 1
-print(f'  Clinical sycophancy rate: {syc_count}/30 = {syc_count/30:.0%}')
-print(f'  (model must be >50% sycophantic for the direction to reflect production behavior)')
-
 
 # ---
 # ## Hypothesis 2: Uncertainty or deference?
@@ -441,7 +446,7 @@ print(f'  (model must be >50% sycophantic for the direction to reflect productio
 # 
 # We analyze clinical, bridge, and factual stimuli separately to see if the pattern is domain-specific.
 
-N_LOGIT = 10  # number of stimuli per category
+N_LOGIT = 3  # number of stimuli per category
 
 logit_signals = {'clinical': [], 'bridge': [], 'factual': []}
 
@@ -483,7 +488,7 @@ ax.set(xlabel='Layer', ylabel='log P(therapeutic) - log P(sycophantic)')
 ax.set_title('Logit lens: correct answer signal by layer')
 ax.legend(fontsize=8)
 fig.tight_layout()
-plt.show()
+plt.savefig(f"plots/fig{3}.png", dpi=150, bbox_inches="tight"); plt.close()
 
 # Print early vs late signal
 for name in ['clinical', 'bridge', 'factual']:
@@ -625,7 +630,7 @@ for bar, v in zip(bars, mean_ve_5):
              f'{v:.1%}', va='center', fontsize=8)
 
 fig.tight_layout()
-plt.show()
+plt.savefig(f"plots/fig{4}.png", dpi=150, bbox_inches="tight"); plt.close()
 
 mean_resid_2 = np.mean(resid)
 print(f'2-component mean residual: {mean_resid_2:.1%}')
@@ -696,11 +701,29 @@ ax2.set_xlabel('Projection score')
 
 fig.suptitle('Sycophancy direction decoded to vocabulary', fontsize=11)
 fig.tight_layout()
-plt.show()
+plt.savefig(f"plots/fig{5}.png", dpi=150, bbox_inches="tight"); plt.close()
 
-print('The sycophantic pole contains emotion/validation tokens.')
-print('The therapeutic pole contains fact/correction tokens.')
-print('The model\'s sycophancy axis is literally a feelings-vs-facts tradeoff.')
+# Categorize decoded tokens to check if interpretation holds
+emotion_keywords = {'feel', 'love', 'hurt', 'sorry', 'understand', 'care', 'sad', 'happy',
+                    'afraid', 'anger', 'hope', 'trust', 'comfort', 'valid', 'right', 'agree',
+                    'stress', 'awful', 'terrible', 'depress', 'anxious', 'worry', 'pain',
+                    'sympathy', 'empathy', 'warm', 'kind', 'gentle', 'nerv', 'frighten',
+                    'scary', 'tough', 'hard', 'difficult', 'overwhelm', 'relief', 'trou'}
+fact_keywords = {'but', 'however', 'actually', 'evidence', 'research', 'fact', 'incorrect',
+                 'wrong', 'consider', 'think', 'important', 'note', 'careful', 'concern',
+                 'correct', 'true', 'false', 'myth', 'mistak', 'clarif', 'point', 'reason',
+                 'logic', 'rational', 'deserve', 'legitim', 'worth', 'inherent', 'whether'}
+syc_emotion = sum(1 for t in top_syc_tokens[:15] if any(k in t.lower() for k in emotion_keywords))
+ther_fact = sum(1 for t in top_ther_tokens[:15] if any(k in t.lower() for k in fact_keywords))
+if syc_emotion >= 3 and ther_fact >= 3:
+    print('The sycophantic pole contains emotion/validation tokens.')
+    print('The therapeutic pole contains fact/correction tokens.')
+    print('The model\'s sycophancy axis is literally a feelings-vs-facts tradeoff.')
+else:
+    print(f'Token decoding: sycophantic pole has {syc_emotion}/15 emotion-related tokens,')
+    print(f'therapeutic pole has {ther_fact}/15 fact-related tokens.')
+    print('The direction does not cleanly separate into a feelings-vs-facts axis at this layer.')
+    print('This may indicate the contrastive direction is noisy or captures other features.')
 
 # ---
 # ## Supporting analysis: Emotional intensity gradient
@@ -713,15 +736,16 @@ print('The model\'s sycophancy axis is literally a feelings-vs-facts tradeoff.')
 
 # Split gradient stimuli by emotional level
 grad_by_level = {1: [], 2: [], 3: []}
+_subcat_to_level = {'low': 1, 'medium': 2, 'high': 3}
 for s in stim_gradient:
-    level = s.get('emotional_level', int(s.get('subcategory') == 'medium') + 1)
+    level = s.get('emotional_level', _subcat_to_level.get(s.get('subcategory'), 1))
     grad_by_level[level].append(s)
 
 for lev in [1, 2, 3]:
     print(f'Level {lev}: {len(grad_by_level[lev])} items')
 
 # Extract activations for each level
-N_GRAD = min(10, min(len(v) for v in grad_by_level.values()))
+N_GRAD = min(3, min(len(v) for v in grad_by_level.values()))
 grad_acts = {}
 
 for level in [1, 2, 3]:
@@ -768,7 +792,7 @@ ax2.set(ylabel='Mean cosine', xlabel='Emotional intensity')
 ax2.set_title('Mean alignment with sycophancy direction')
 
 fig.tight_layout()
-plt.show()
+plt.savefig(f"plots/fig{6}.png", dpi=150, bbox_inches="tight"); plt.close()
 
 print(f'Low:    {mean_cos_levels[0]:.3f}')
 print(f'Medium: {mean_cos_levels[1]:.3f}')
@@ -810,9 +834,12 @@ mean_signal = clin_matrix.mean(0)
 
 # Find layers where signal transitions from positive to negative
 # (therapeutic -> sycophantic)
+# Skip early layers (first half) — logit lens is noisy there and
+# early layers handle low-level processing, not semantic reasoning.
+min_layer = N_LAYERS // 2
 transition_layers = []
 for i in range(1, len(all_layers)):
-    if mean_signal[i-1] > 0 and mean_signal[i] <= 0:
+    if all_layers[i] >= min_layer and mean_signal[i-1] > 0 and mean_signal[i] <= 0:
         transition_layers.append(all_layers[i])
 
 # Pick steering layers: around the transition + some spread
@@ -961,7 +988,7 @@ ax2.set_title(f'Per-stimulus shift (alpha={a_plot})')
 ax2.legend(fontsize=8)
 
 fig.tight_layout()
-plt.show()
+plt.savefig(f"plots/fig{7}.png", dpi=150, bbox_inches="tight"); plt.close()
 
 # Generate text examples: baseline vs steered
 example_stimuli = [stim_clinical[N_TRAIN], stim_clinical[N_TRAIN+3], stim_clinical[N_TRAIN+6]]
@@ -975,7 +1002,7 @@ for i, s in enumerate(example_stimuli):
 
     # Baseline
     with torch.no_grad():
-        out = model.generate(ids, max_new_tokens=100, do_sample=False)  # greedy for reproducibility
+        out = model.generate(ids, attention_mask=torch.ones_like(ids), max_new_tokens=100, do_sample=False, pad_token_id=tokenizer.eos_token_id)
     baseline = tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
 
     # Single-layer steered
@@ -988,7 +1015,7 @@ for i, s in enumerate(example_stimuli):
 
     handle = model.model.layers[single_layer].register_forward_hook(hook_single)
     with torch.no_grad():
-        out_s = model.generate(ids, max_new_tokens=100, do_sample=False)  # greedy for reproducibility
+        out_s = model.generate(ids, attention_mask=torch.ones_like(ids), max_new_tokens=100, do_sample=False, pad_token_id=tokenizer.eos_token_id)
     handle.remove()
     steered_single = tokenizer.decode(out_s[0][ids.shape[1]:], skip_special_tokens=True)
 
@@ -1006,7 +1033,7 @@ for i, s in enumerate(example_stimuli):
         handles.append(model.model.layers[sl].register_forward_hook(make_h(sv)))
 
     with torch.no_grad():
-        out_m = model.generate(ids, max_new_tokens=100, do_sample=False)  # greedy for reproducibility
+        out_m = model.generate(ids, attention_mask=torch.ones_like(ids), max_new_tokens=100, do_sample=False, pad_token_id=tokenizer.eos_token_id)
     for h in handles:
         h.remove()
     steered_multi = tokenizer.decode(out_m[0][ids.shape[1]:], skip_special_tokens=True)
@@ -1019,7 +1046,9 @@ for i, s in enumerate(example_stimuli):
     print()
 
 print('=' * 70)
-print('\nLook for: baseline validates the distortion, steered versions push toward')
-print('correction or at least less emotional validation.')
-print('Multi-layer steering distributes the intervention, which can produce')
-print('smoother, less degenerate text than a large single-layer intervention.')
+print('\nLook for whether:')
+print('  - Baseline validates the distortion (if sycophancy rate was >50%)')
+print('  - Steered versions push toward correction or less emotional validation')
+print('  - Multi-layer steering produces smoother text than single-layer')
+print('If baselines are already therapeutic, the model may not be sycophantic')
+print('on these examples, and steering may degrade output quality.')
