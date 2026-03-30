@@ -135,11 +135,18 @@ print(f'Layers: {N_LAYERS} total, sampling {len(LAYERS)}: {LAYERS}')
 print(f'VRAM: {vram():.1f} GB')
 
 # Behavioral examples: what does the model actually say?
-# We generate greedy responses to a few clinical stimuli so the reader
-# can see whether the model validates or challenges the distortion.
+# Pick diverse distortion types (not just catastrophizing) to show
+# how the model handles different cognitive distortions.
+_example_types = ['personalization', 'mind_reading', 'emotional_reasoning']
+_examples = []
+for et in _example_types:
+    for s in stim_clinical:
+        if s['subcategory'] == et and s not in _examples:
+            _examples.append(s)
+            break
 print('\nBehavioral examples (greedy generation):')
 print('=' * 70)
-for s in stim_clinical[:3]:
+for s in _examples:
     prompt = format_prompt(tokenizer, s['user_prompt'])
     ids = tokenizer.encode(prompt, return_tensors='pt').to(get_device(model))
     with torch.no_grad():
@@ -317,10 +324,13 @@ for stage, model_id in CHECKPOINTS.items():
     print(f'  Loaded in {time.time() - t0:.0f}s, VRAM: {vram():.1f} GB')
 
     # Empathy direction: therapeutic (warm) vs cold
+    # use_chat_template=False for controlled cross-checkpoint comparison
+    # (base model may lack a chat template, which would confound results)
     emp_pos, emp_neg = batch_extract_contrastive(
         mdl, tok, h2_stimuli,
         'therapeutic_completion', 'cold_completion',
-        layers=LAYERS, desc=f'{stage} empathy'
+        layers=LAYERS, desc=f'{stage} empathy',
+        use_chat_template=False
     )
     dir_emp = compute_contrastive_direction(emp_pos, emp_neg)
 
@@ -328,7 +338,8 @@ for stage, model_id in CHECKPOINTS.items():
     syc_pos, syc_neg = batch_extract_contrastive(
         mdl, tok, h2_stimuli,
         'sycophantic_completion', 'therapeutic_completion',
-        layers=LAYERS, desc=f'{stage} sycophancy'
+        layers=LAYERS, desc=f'{stage} sycophancy',
+        use_chat_template=False
     )
     dir_syc = compute_contrastive_direction(syc_pos, syc_neg)
 
@@ -547,26 +558,16 @@ cw_pos, cw_neg = batch_extract_contrastive(
 )
 dir_clinical_warmth = compute_contrastive_direction(cw_pos, cw_neg)
 
-# Framing acceptance from distortions (these don't have cold_completion,
-# so we use a different proxy: distortions sycophantic vs factual therapeutic)
-# Actually distortions do have cold_completion. Let's check:
-has_cold = all('cold_completion' in s for s in stim_distort[:N_TRAIN])
-if has_cold:
-    print('Extracting framing acceptance from cognitive distortions...')
-    fa_pos, fa_neg = batch_extract_contrastive(
-        model, tokenizer, stim_distort[:N_TRAIN],
-        'sycophantic_completion', 'cold_completion',
-        layers=LAYERS, desc='Framing acceptance'
-    )
-    dir_framing = compute_contrastive_direction(fa_pos, fa_neg)
-else:
-    print('Distortions lack cold completions; using bridge sycophantic vs cold.')
-    fa_pos, fa_neg = batch_extract_contrastive(
-        model, tokenizer, stim_bridge[:N_TRAIN],
-        'sycophantic_completion', 'cold_completion',
-        layers=LAYERS, desc='Framing acceptance'
-    )
-    dir_framing = compute_contrastive_direction(fa_pos, fa_neg)
+# Framing acceptance: use clear-answer clinical stimuli (different data source
+# from stim_clinical which is cognitive_distortions.json) to avoid duplicate
+# components. Contrast: sycophantic vs therapeutic on clinical_correct_answer.
+print('Extracting framing acceptance from clinical clear-answer stimuli...')
+fa_pos, fa_neg = batch_extract_contrastive(
+    model, tokenizer, stim_clinical_clear[:min(N_TRAIN, len(stim_clinical_clear))],
+    'sycophantic_completion', 'therapeutic_completion',
+    layers=LAYERS, desc='Framing acceptance'
+)
+dir_framing = compute_contrastive_direction(fa_pos, fa_neg)
 
 cleanup()
 print('\nAll component directions extracted.')
@@ -636,9 +637,19 @@ mean_resid_2 = np.mean(resid)
 print(f'2-component mean residual: {mean_resid_2:.1%}')
 print(f'5-component mean residual: {mean_resid_5:.1%}')
 print()
-print('Most of the clinical sycophancy direction is NOT explained by empathy + factual agreement.')
-print('Even with 5 components, a large fraction remains unexplained.')
-print('This suggests clinical sycophancy involves representational dimensions we have not yet identified.')
+if mean_resid_2 > 0.5:
+    print('Most of the clinical sycophancy direction is NOT explained by empathy + factual agreement.')
+else:
+    print('Empathy + factual agreement explain a substantial portion of clinical sycophancy.')
+if mean_resid_5 > 0.1:
+    print(f'Even with 5 components, {mean_resid_5:.0%} remains unexplained.')
+    print('This suggests clinical sycophancy involves representational dimensions we have not yet identified.')
+elif mean_resid_5 < 0.05:
+    print('With 5 components, nearly all variance is explained.')
+    print('Note: with small sample sizes, this may reflect overfitting of directions rather')
+    print('than genuine explanatory power. Verify with larger N_TRAIN.')
+else:
+    print(f'5 components explain {1 - mean_resid_5:.0%} of the variance.')
 
 # ---
 # ## Supporting analysis: Direction token decoding
@@ -651,11 +662,18 @@ print('This suggests clinical sycophancy involves representational dimensions we
 
 # Pick a mid-to-late layer where the direction is most meaningful
 # (directions are most interpretable in later layers where they're closer to output)
-target_layer = LAYERS[len(LAYERS) * 2 // 3]  # ~66% depth
-print(f'Analyzing direction at layer {target_layer}')
-
-# Get the unembedding matrix (lm_head weight)
+# Pick the layer where the direction projects most strongly onto vocabulary
+# (strongest max projection magnitude) rather than hardcoded 66% depth
 unembed = model.lm_head.weight.float().cpu()  # (vocab_size, hidden_dim)
+best_layer, best_mag = None, 0
+for l in LAYERS:
+    proj = unembed @ dir_clinical[l].float()
+    mag = proj.abs().max().item()
+    if mag > best_mag:
+        best_mag = mag
+        best_layer = l
+target_layer = best_layer
+print(f'Analyzing direction at layer {target_layer} (strongest projection: {best_mag:.3f})')
 
 # Project the clinical sycophancy direction through unembedding
 direction = dir_clinical[target_layer].float()

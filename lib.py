@@ -159,20 +159,25 @@ def extract_completion_acts(model, tokenizer, prompt, completion,
 
 
 def batch_extract_contrastive(model, tokenizer, stimuli, pos_key, neg_key,
-                              layers=None, n_completion_tokens=15, desc="Extracting"):
+                              layers=None, n_completion_tokens=15, desc="Extracting",
+                              use_chat_template=True):
     """Extract paired activations for a list of contrastive stimuli.
 
     n_completion_tokens: truncate both completions to this many tokens
     before extracting, avoiding length confounds in the mean pooling.
+    use_chat_template: if False, skip chat formatting for controlled
+    cross-checkpoint comparisons where some models lack templates.
     """
     pos_list, neg_list = [], []
     for i, s in enumerate(tqdm(stimuli, desc=desc)):
         pos_list.append(extract_completion_acts(
             model, tokenizer, s["user_prompt"], s[pos_key], layers,
-            n_completion_tokens=n_completion_tokens))
+            n_completion_tokens=n_completion_tokens,
+            use_chat_template=use_chat_template))
         neg_list.append(extract_completion_acts(
             model, tokenizer, s["user_prompt"], s[neg_key], layers,
-            n_completion_tokens=n_completion_tokens))
+            n_completion_tokens=n_completion_tokens,
+            use_chat_template=use_chat_template))
         if (i + 1) % 10 == 0:
             cleanup()
     return pos_list, neg_list
@@ -296,13 +301,23 @@ def decompose_direction(target, components):
         result["projections"][name] = proj
         result["variance_explained"][name] = proj ** 2 / total_var if total_var > 0 else 0
 
+    used_dirs = []
     for name, comp in components.items():
         cn = F.normalize(comp, dim=0)
+        # Orthogonalize against all previously used directions
+        for prev in used_dirs:
+            cn = cn - (cn @ prev) * prev
+        cn_norm = cn.norm()
+        if cn_norm < 1e-8:
+            result["unique_variance_explained"][name] = 0.0
+            continue
+        cn = cn / cn_norm
         before = residual.norm().item() ** 2
         residual = residual - (residual @ cn) * cn
         after = residual.norm().item() ** 2
         result["unique_variance_explained"][name] = (
             (before - after) / total_var if total_var > 0 else 0)
+        used_dirs.append(cn)
 
     result["residual_variance_fraction"] = (
         residual.norm().item() ** 2 / total_var if total_var > 0 else 0)
