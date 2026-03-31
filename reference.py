@@ -279,6 +279,114 @@ else:
           f'C->F acc={mean_acc_c2f:.2f}).')
     print('The relationship between clinical and factual sycophancy directions is not clear-cut.')
 
+# Permutation test: is the clinical–factual cosine significantly different from chance?
+# Use the median sampled layer (pre-registered, not chosen post-hoc)
+test_layer = LAYERS[len(LAYERS) // 2]
+print(f'\nPermutation test (layer {test_layer}, n=1000):')
+perm_result = permutation_test_cosine(
+    clin_pos, clin_neg, fact_pos, fact_neg,
+    layer=test_layer, n_perms=1000
+)
+print(f'  Observed cosine:  {perm_result["observed"]:.3f}')
+print(f'  Null mean ± std:  {perm_result["null_mean"]:.3f} ± {perm_result["null_std"]:.3f}')
+print(f'  p-value (2-tail): {perm_result["p_value"]:.4f}')
+if perm_result['p_value'] < 0.05:
+    print(f'  The clinical and factual directions are significantly different from random (p < 0.05).')
+else:
+    print(f'  Cannot reject the null: observed cosine is consistent with random directions.')
+
+# ---
+# ## Per-distortion-type breakdown
+#
+# Measure how the clinical sycophancy direction interacts with each
+# cognitive distortion subcategory individually.
+
+print('\n' + '=' * 70)
+print('PER-DISTORTION-TYPE ANALYSIS')
+print('=' * 70)
+
+# Group stimuli by subcategory
+from collections import defaultdict
+subcat_stimuli = defaultdict(list)
+for s in stim_clinical:
+    subcat_stimuli[s['subcategory']].append(s)
+
+# For each subcategory with enough stimuli:
+# 1. Extract contrastive direction (sycophantic vs therapeutic)
+# 2. Cosine with overall clinical direction
+# 3. Generate a behavioral example
+subcat_results = {}
+test_layer = LAYERS[len(LAYERS) // 2]  # median layer for comparisons
+print(f'\nUsing layer {test_layer} for direction comparisons\n')
+
+for subcat in sorted(subcat_stimuli.keys()):
+    items = subcat_stimuli[subcat]
+    n_items = min(len(items), N_TRAIN)
+    if n_items < 2:
+        print(f'{subcat}: skipped (only {len(items)} items)')
+        continue
+
+    # Extract direction for this subcategory
+    sc_pos, sc_neg = batch_extract_contrastive(
+        model, tokenizer, items[:n_items],
+        'sycophantic_completion', 'therapeutic_completion',
+        layers=LAYERS, desc=subcat
+    )
+    dir_sc = compute_contrastive_direction(sc_pos, sc_neg)
+
+    # Cosine with overall clinical direction at test layer
+    cos_with_clin = F.cosine_similarity(
+        dir_sc[test_layer].unsqueeze(0),
+        dir_clinical[test_layer].unsqueeze(0)
+    ).item()
+
+    # Generate a behavioral example
+    prompt = format_prompt(tokenizer, items[0]['user_prompt'])
+    ids = tokenizer.encode(prompt, return_tensors='pt').to(get_device(model))
+    with torch.no_grad():
+        out = model.generate(ids, attention_mask=torch.ones_like(ids),
+                             max_new_tokens=60, do_sample=False,
+                             pad_token_id=tokenizer.eos_token_id)
+    response = tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
+
+    subcat_results[subcat] = {
+        'n_items': n_items,
+        'cos_with_clinical': cos_with_clin,
+        'example_prompt': items[0]['user_prompt'][:80],
+        'example_response': response[:150],
+    }
+
+# Print results sorted by cosine (highest alignment with clinical sycophancy first)
+print(f'\n{"Distortion type":<25} {"N":>3} {"cos(sub, clin)":>14}')
+print('-' * 45)
+for subcat, r in sorted(subcat_results.items(), key=lambda x: -x[1]['cos_with_clinical']):
+    print(f'{subcat:<25} {r["n_items"]:>3} {r["cos_with_clinical"]:>+14.3f}')
+
+print('\nBehavioral examples per type:')
+print('-' * 70)
+for subcat, r in sorted(subcat_results.items(), key=lambda x: -x[1]['cos_with_clinical']):
+    print(f'\n[{subcat}] cos={r["cos_with_clinical"]:+.3f}')
+    print(f'  USER:  {r["example_prompt"]}...')
+    print(f'  MODEL: {r["example_response"]}')
+
+# Bar chart
+fig, ax = plt.subplots(figsize=(10, 5))
+sorted_subcats = sorted(subcat_results.items(), key=lambda x: -x[1]['cos_with_clinical'])
+names = [s for s, _ in sorted_subcats]
+cosines = [r['cos_with_clinical'] for _, r in sorted_subcats]
+colors = [RED if c > 0.3 else ORANGE if c > 0.1 else BLUE for c in cosines]
+ax.barh(range(len(names)), cosines, color=colors)
+ax.set_yticks(range(len(names)))
+ax.set_yticklabels(names, fontsize=9)
+ax.set_xlabel('Cosine similarity with overall clinical sycophancy direction')
+ax.set_title('Per-distortion alignment with sycophancy direction')
+ax.axvline(0, color='gray', ls=':', alpha=0.4)
+ax.invert_yaxis()
+fig.tight_layout()
+plt.savefig("plots/fig_distortion_breakdown.png", dpi=150, bbox_inches="tight"); plt.close()
+
+print('\nRed = strongly aligned (>0.3), Orange = moderate (>0.1), Blue = weak/opposed')
+
 # ---
 # ## Hypothesis 3: Does preference optimization conflate empathy and sycophancy?
 # 
