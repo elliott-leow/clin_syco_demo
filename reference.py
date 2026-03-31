@@ -1178,3 +1178,179 @@ print('  - Steered versions push toward correction or less emotional validation'
 print('  - Multi-layer steering produces smoother text than single-layer')
 print('If baselines are already therapeutic, the model may not be sycophantic')
 print('on these examples, and steering may degrade output quality.')
+
+# ---
+# ## Export all results to JSON
+#
+# Collect all inputs (stimuli) and outputs (computed results, model
+# generations) into a single JSON file for downstream analysis.
+
+print('\n' + '=' * 70)
+print('EXPORTING RESULTS')
+print('=' * 70)
+
+# Re-generate steering examples into a data structure (they were only printed above)
+steering_examples = []
+for i, s in enumerate(example_stimuli):
+    ids = tokenizer.encode(format_prompt(tokenizer, s['user_prompt']), return_tensors='pt').to(device)
+    with torch.no_grad():
+        out = model.generate(ids, attention_mask=torch.ones_like(ids), max_new_tokens=100, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+    baseline = tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
+
+    vec = dir_clinical[single_layer].to(device=device, dtype=dtype)
+    def hook_s(mod, inp, out, v=vec, a=alpha_gen):
+        h = out[0] if isinstance(out, tuple) else out
+        h = h.clone(); h -= a * v
+        return (h,) + out[1:] if isinstance(out, tuple) else h
+    handle = model.model.layers[single_layer].register_forward_hook(hook_s)
+    with torch.no_grad():
+        out_s = model.generate(ids, attention_mask=torch.ones_like(ids), max_new_tokens=100, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+    handle.remove()
+    steered_single = tokenizer.decode(out_s[0][ids.shape[1]:], skip_special_tokens=True)
+
+    handles = []
+    for sl in steer_layers:
+        sv = dir_clinical[sl].to(device=device, dtype=dtype)
+        def make_h(v, a=alpha_gen / np.sqrt(len(steer_layers))):
+            def fn(mod, inp, out):
+                h = out[0] if isinstance(out, tuple) else out
+                h = h.clone(); h -= a * v
+                return (h,) + out[1:] if isinstance(out, tuple) else h
+            return fn
+        handles.append(model.model.layers[sl].register_forward_hook(make_h(sv)))
+    with torch.no_grad():
+        out_m = model.generate(ids, attention_mask=torch.ones_like(ids), max_new_tokens=100, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+    for h in handles:
+        h.remove()
+    steered_multi = tokenizer.decode(out_m[0][ids.shape[1]:], skip_special_tokens=True)
+
+    steering_examples.append({
+        'subcategory': s['subcategory'],
+        'user_prompt': s['user_prompt'],
+        'sycophantic_completion': s['sycophantic_completion'],
+        'therapeutic_completion': s['therapeutic_completion'],
+        'baseline_generation': baseline,
+        'single_layer_steered': steered_single,
+        'multi_layer_steered': steered_multi,
+    })
+
+# Build the full results dict
+results = {
+    'metadata': {
+        'model': MODEL_DPO,
+        'n_layers': N_LAYERS,
+        'sampled_layers': LAYERS,
+        'n_train': N_TRAIN,
+        'n_logit': N_LOGIT,
+    },
+    'stimuli': {
+        'clinical': stim_clinical,
+        'clinical_clear_answer': stim_clinical_clear,
+        'factual': stim_factual,
+        'cognitive_distortions': stim_distort,
+        'bridge': stim_bridge,
+        'emotional_gradient': stim_gradient,
+    },
+    'behavioral_examples': [
+        {
+            'subcategory': s['subcategory'],
+            'user_prompt': s['user_prompt'],
+            'model_response': subcat_results[s['subcategory']]['example_response']
+        }
+        for s in _examples
+    ],
+    'h1_direction_similarity': {
+        'cosine_clinical_vs_factual': {str(k): v for k, v in cos_clin_fact.items()},
+        'cosine_clinical_vs_bridge': {str(k): v for k, v in cos_clin_bridge.items()},
+        'cosine_bridge_vs_factual': {str(k): v for k, v in cos_bridge_fact.items()},
+        'mean_cosine_clin_fact': float(mean_cos),
+        'cross_domain_probe_fact_to_clin': {str(k): v for k, v in probe_fact_to_clin.items()},
+        'cross_domain_probe_clin_to_fact': {str(k): v for k, v in probe_clin_to_fact.items()},
+        'mean_auc_fact_to_clin': float(mean_auc_f2c),
+        'mean_acc_clin_to_fact': float(mean_acc_c2f),
+        'within_domain_clinical': {str(k): v for k, v in within_clin.items()},
+        'within_domain_factual': {str(k): v for k, v in within_fact.items()},
+        'permutation_test': perm_result,
+    },
+    'per_distortion_breakdown': {
+        subcat: {
+            'n_items': r['n_items'],
+            'cosine_with_clinical': r['cos_with_clinical'],
+            'example_prompt': r['example_prompt'],
+            'example_response': r['example_response'],
+        }
+        for subcat, r in subcat_results.items()
+    },
+    'h3_empathy_sycophancy': {
+        stage: {
+            'cosine_by_layer': {str(k): v for k, v in r['cosine_by_layer'].items()},
+            'mean_cosine': r['mean_cosine'],
+            'bootstrap_ci': bootstrap_ci(r['all_cosines']),
+        }
+        for stage, r in h2_results.items()
+    },
+    'h2_logit_lens': {
+        name: [
+            {str(k): v for k, v in sig.items()}
+            for sig in signals
+        ]
+        for name, signals in logit_signals.items()
+    },
+    'variance_decomposition': {
+        '2_component': {
+            str(l): {
+                'empathy': decomp_2[l]['unique_variance_explained']['empathy'],
+                'factual': decomp_2[l]['unique_variance_explained']['factual'],
+                'residual': decomp_2[l]['residual_variance_fraction'],
+            }
+            for l in sorted(decomp_2.keys())
+        },
+        '5_component': {
+            str(l): {
+                **{n: decomp_5[l]['unique_variance_explained'][n] for n in names_5[:5]},
+                'residual': decomp_5[l]['residual_variance_fraction'],
+            }
+            for l in sorted(decomp_5.keys())
+        },
+        'mean_residual_2comp': float(mean_resid_2),
+        'mean_residual_5comp': float(mean_resid_5),
+    },
+    'token_decoding': {
+        'layer': target_layer,
+        'sycophantic_pole': [
+            {'token': tok, 'logit': float(logits[idx])}
+            for tok, idx in zip(top_syc_tokens[:15], top_syc_idx[:15])
+        ],
+        'therapeutic_pole': [
+            {'token': tok, 'logit': float(-logits[idx])}
+            for tok, idx in zip(top_ther_tokens[:15], top_ther_idx[:15])
+        ],
+    },
+    'emotional_gradient': {
+        'cosine_by_level': {
+            str(level): {str(k): v for k, v in cos_by_level[level].items()}
+            for level in [1, 2, 3]
+        },
+        'mean_cosine_by_level': {
+            str(level): float(np.mean(list(cos_by_level[level].values())))
+            for level in [1, 2, 3]
+        },
+    },
+    'steering': {
+        'transition_layer': mid,
+        'single_layer': single_layer,
+        'multi_layers': steer_layers,
+        'alpha_gen': alpha_gen,
+        'logit_shifts_single': {str(a): float(np.mean(results_single[a])) for a in alphas},
+        'logit_shifts_multi': {str(a): float(np.mean(results_multi[a])) for a in alphas},
+        'per_stimulus_shifts_single': {str(a): [float(x) for x in results_single[a]] for a in alphas},
+        'per_stimulus_shifts_multi': {str(a): [float(x) for x in results_multi[a]] for a in alphas},
+        'examples': steering_examples,
+    },
+}
+
+out_path = 'data/results.json'
+with open(out_path, 'w') as f:
+    json.dump(results, f, indent=2, default=str)
+print(f'\nResults saved to {out_path}')
+print(f'File size: {os.path.getsize(out_path) / 1024:.0f} KB')
