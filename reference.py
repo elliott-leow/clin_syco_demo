@@ -1047,6 +1047,19 @@ alphas = [2.0, 4.0, 8.0]
 device = get_device(model)
 dtype = next(model.parameters()).dtype
 
+def measure_baseline_preference(model, tokenizer, stimulus):
+    """Measure baseline log P(therapeutic) - log P(sycophantic). Negative = sycophantic."""
+    ids = tokenizer.encode(format_prompt(tokenizer, stimulus['user_prompt']), return_tensors='pt').to(device)
+    ther_ids = tokenizer.encode(stimulus['therapeutic_completion'],
+                               add_special_tokens=False)[:3]
+    syc_ids = tokenizer.encode(stimulus['sycophantic_completion'],
+                              add_special_tokens=False)[:3]
+    with torch.no_grad():
+        logits_base = model(ids).logits[0, -1].float()
+    lp_base = F.log_softmax(logits_base, dim=-1)
+    return float(np.mean([lp_base[t].item() for t in ther_ids]) - np.mean([lp_base[t].item() for t in syc_ids]))
+
+
 def measure_logit_shift(model, tokenizer, stimulus, layer, direction, alpha):
     """Measure change in therapeutic-vs-sycophantic logit difference from steering."""
     ids = tokenizer.encode(format_prompt(tokenizer, stimulus['user_prompt']), return_tensors='pt').to(device)
@@ -1168,11 +1181,32 @@ ax2.legend(fontsize=8)
 fig.tight_layout()
 plt.savefig(f"plots/fig{7}.png", dpi=150, bbox_inches="tight"); plt.close()
 
-# Generate text examples: baseline vs steered
-example_stimuli = [stim_clinical[N_TRAIN], stim_clinical[N_TRAIN+3], stim_clinical[N_TRAIN+6]]
+# Find stimuli where the model is most sycophantic (lowest baseline preference)
+print('\nScanning for sycophantic baseline responses...')
+baseline_prefs = []
+for s in tqdm(test_stimuli, desc='Baseline scan'):
+    pref = measure_baseline_preference(model, tokenizer, s)
+    baseline_prefs.append((pref, s))
+
+baseline_prefs.sort(key=lambda x: x[0])  # most sycophantic first
+print(f'Most sycophantic baseline: {baseline_prefs[0][0]:+.3f}')
+print(f'Most therapeutic baseline: {baseline_prefs[-1][0]:+.3f}')
+print(f'Sycophantic (pref < 0): {sum(1 for p, _ in baseline_prefs if p < 0)}/{len(baseline_prefs)}')
+
+# Pick 3 most sycophantic examples from different subcategories
+example_stimuli = []
+seen_subcats = set()
+for pref, s in baseline_prefs:
+    if s['subcategory'] not in seen_subcats:
+        example_stimuli.append(s)
+        seen_subcats.add(s['subcategory'])
+        print(f'  Selected [{s["subcategory"]}] pref={pref:+.3f}')
+    if len(example_stimuli) == 3:
+        break
+
 alpha_gen = 6.0
 
-print(f'Generating examples (alpha={alpha_gen})...\n')
+print(f'\nGenerating examples (alpha={alpha_gen})...\n')
 print('=' * 70)
 
 for i, s in enumerate(example_stimuli):
@@ -1401,6 +1435,12 @@ results = {
         'logit_shifts_multi': {str(a): float(np.mean(results_multi[a])) for a in alphas},
         'per_stimulus_shifts_single': {str(a): [float(x) for x in results_single[a]] for a in alphas},
         'per_stimulus_shifts_multi': {str(a): [float(x) for x in results_multi[a]] for a in alphas},
+        'baseline_preference_scan': {
+            'n_sycophantic': sum(1 for p, _ in baseline_prefs if p < 0),
+            'n_total': len(baseline_prefs),
+            'most_sycophantic': baseline_prefs[0][0],
+            'most_therapeutic': baseline_prefs[-1][0],
+        },
         'examples': steering_examples,
     },
 }
