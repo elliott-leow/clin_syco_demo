@@ -77,9 +77,12 @@ def clear_hf_cache(model_id):
         "models--" + model_id.replace("/", "--"),
     )
     if os.path.exists(cache_dir):
-        sz = sum(os.path.getsize(os.path.join(dp, f))
-                 for dp, dn, fn in os.walk(cache_dir) for f in fn)
-        shutil.rmtree(cache_dir)
+        try:
+            sz = sum(os.path.getsize(os.path.join(dp, f))
+                     for dp, dn, fn in os.walk(cache_dir) for f in fn)
+        except (FileNotFoundError, OSError):
+            sz = 0
+        shutil.rmtree(cache_dir, ignore_errors=True)
         print(f"  Cleared {sz / 1e9:.1f} GB cache for {model_id}")
 
 

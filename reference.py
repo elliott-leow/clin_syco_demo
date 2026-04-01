@@ -59,10 +59,20 @@ set_seeds(42)
 # ## Load stimuli and model
 # 
 # Stimuli are loaded from `data/stimuli/` in the repo. We use:
-# - **Clinical stimuli** (`clinical_correct_answer.json`, `cognitive_distortions.json`): dangerous beliefs where sycophancy = clinical harm
-# - **Factual controls** (`factual_control.json`): ordinary factual errors (capitals, myths) where sycophancy = simple agreement
-# - **Emotional gradient** (`emotional_intensity_gradient.json`): same claims at low/medium/high emotional intensity
-# - **Bridge** (`clinical_bridge.json`): scenarios that bridge clinical and factual (medical myths with emotional context)
+# - **Clinical stimuli** (`clinical_sycophancy_dataset.json`): 300 expert-validated
+#   cognitive distortion scenarios with `judge_reasoning` explaining why the
+#   sycophantic response is clinically harmful (not merely "less empathic").
+#   This addresses the ambiguity where empathic validation of a distortion
+#   could be mistaken for appropriate therapeutic warmth.
+# - **Clinical cold-completion stimuli** (`cognitive_distortions.json`): older set
+#   with `cold_completion` field, used only for empathy-direction analyses (H3,
+#   variance decomposition) that require a cold vs therapeutic contrast.
+# - **Clinical clear-answer** (`clinical_correct_answer.json`): clinical scenarios
+#   with unambiguous correct answers
+# - **Factual controls** (`factual_control.json`): ordinary factual errors
+# - **Bridge** (`clinical_bridge.json`): medical myths with emotional context
+# - **Emotional gradient** (`emotional_intensity_gradient.json`): same claims
+#   at low/medium/high emotional intensity
 
 from pathlib import Path
 
@@ -72,17 +82,17 @@ def load_json(p):
     with open(p) as f:
         return json.load(f)
 
-stim_clinical = load_json(STIM_DIR / 'cognitive_distortions.json')
+stim_clinical = load_json(STIM_DIR / 'clinical_sycophancy_dataset.json')
+stim_clinical_cold = load_json(STIM_DIR / 'cognitive_distortions.json')
 stim_clinical_clear = load_json(STIM_DIR / 'clinical_correct_answer.json')
 stim_factual = load_json(STIM_DIR / 'factual_control.json')
-stim_distort = load_json(STIM_DIR / 'cognitive_distortions.json')
 stim_bridge = load_json(STIM_DIR / 'clinical_bridge.json')
 stim_gradient = load_json(STIM_DIR / 'emotional_intensity_gradient.json')
 
-print(f'Clinical distortions:    {len(stim_clinical)} items')
+print(f'Clinical (validated):    {len(stim_clinical)} items')
+print(f'Clinical (cold-compl):   {len(stim_clinical_cold)} items')
 print(f'Clinical clear-answer:   {len(stim_clinical_clear)} items')
 print(f'Factual controls:       {len(stim_factual)} items')
-print(f'Cognitive distortions:   {len(stim_distort)} items')
 print(f'Clinical bridge:         {len(stim_bridge)} items')
 print(f'Emotional gradient:      {len(stim_gradient)} items')
 
@@ -170,7 +180,7 @@ print('=' * 70)
 # We also train a linear probe on one domain and test it on the other. Asymmetric transfer (factual-to-clinical works but not vice versa) would mean clinical sycophancy contains dimensions that factual sycophancy doesn't.
 
 # Use N_TRAIN items from each domain for direction computation
-N_TRAIN = 10  # reduced for 1B model on CPU
+N_TRAIN = 50
 
 print('Extracting clinical activations...')
 clin_pos, clin_neg = batch_extract_contrastive(
@@ -296,6 +306,72 @@ else:
     print(f'  Cannot reject the null: observed cosine is consistent with random directions.')
 
 # ---
+# ## Dataset validation: old (ambiguous) vs new (validated) directions
+#
+# The old cognitive_distortions.json had an ambiguity: "sycophantic" responses
+# could be read as empathic validation. The new dataset resolves this with
+# expert-validated items and judge_reasoning. We compare the contrastive
+# directions from both datasets to quantify whether the ambiguity mattered.
+
+print('\n' + '=' * 70)
+print('DATASET VALIDATION: OLD vs NEW DIRECTIONS')
+print('=' * 70)
+
+# Extract direction from old (ambiguous) dataset
+n_old = min(N_TRAIN, len(stim_clinical_cold))
+print(f'\nExtracting old-dataset direction (N={n_old})...')
+old_pos, old_neg = batch_extract_contrastive(
+    model, tokenizer, stim_clinical_cold[:n_old],
+    'sycophantic_completion', 'therapeutic_completion',
+    layers=LAYERS, desc='Old clinical'
+)
+dir_clinical_old = compute_contrastive_direction(old_pos, old_neg)
+
+cos_old_new = cosine_sim_by_layer(dir_clinical_old, dir_clinical)
+mean_cos_old_new = np.mean(list(cos_old_new.values()))
+print(f'Mean cosine(old, new): {mean_cos_old_new:.3f}')
+if mean_cos_old_new > 0.8:
+    print('Old and new directions are closely aligned — the ambiguity did not')
+    print('substantially alter the extracted direction.')
+elif mean_cos_old_new > 0.4:
+    print('Moderate alignment — the validated dataset captures a partially')
+    print('different direction, suggesting the ambiguity introduced noise.')
+else:
+    print('Low alignment — the validated dataset captures a substantially')
+    print('different direction. The old "sycophantic" label was conflating')
+    print('empathic validation with genuinely harmful agreement.')
+
+# Split-half reliability: does the new dataset give a stable direction?
+print(f'\nSplit-half reliability (N={N_TRAIN} per half):')
+np.random.seed(42)
+indices = np.random.permutation(min(2 * N_TRAIN, len(stim_clinical)))
+half_a = [stim_clinical[i] for i in indices[:N_TRAIN]]
+half_b = [stim_clinical[i] for i in indices[N_TRAIN:2*N_TRAIN]]
+
+a_pos, a_neg = batch_extract_contrastive(
+    model, tokenizer, half_a,
+    'sycophantic_completion', 'therapeutic_completion',
+    layers=LAYERS, desc='Half A'
+)
+b_pos, b_neg = batch_extract_contrastive(
+    model, tokenizer, half_b,
+    'sycophantic_completion', 'therapeutic_completion',
+    layers=LAYERS, desc='Half B'
+)
+dir_a = compute_contrastive_direction(a_pos, a_neg)
+dir_b = compute_contrastive_direction(b_pos, b_neg)
+cos_split = cosine_sim_by_layer(dir_a, dir_b)
+mean_split = np.mean(list(cos_split.values()))
+print(f'Mean cosine(half_A, half_B): {mean_split:.3f}')
+if mean_split > 0.7:
+    print('High split-half reliability — the direction is stable across samples.')
+else:
+    print('Low split-half reliability — the direction varies across samples.')
+    print('Consider increasing N_TRAIN or checking for heterogeneous subcategories.')
+
+cleanup()
+
+# ---
 # ## Per-distortion-type breakdown
 #
 # Measure how the clinical sycophancy direction interacts with each
@@ -409,10 +485,11 @@ CHECKPOINTS = {
     'instruct': 'allenai/OLMo-2-0425-1B-Instruct',
 }
 
-# Use clinical stimuli that have both therapeutic and sycophantic completions
+# Use older clinical stimuli that have cold_completion field
+# (the new validated dataset doesn't include cold completions)
 # Empathy direction: therapeutic (warm+correct) vs cold (cold+correct)
 # Sycophancy direction: sycophantic (warm+wrong) vs therapeutic (warm+correct)
-h2_stimuli = stim_clinical[:10]  # items with cold_completion field
+h2_stimuli = stim_clinical_cold[:N_TRAIN]  # items with cold_completion field
 N_H2 = len(h2_stimuli)
 
 h2_results = {}  # stage -> {cosine_by_layer, mean_cosine}
@@ -565,13 +642,13 @@ except:
 # 
 # We analyze clinical, bridge, and factual stimuli separately to see if the pattern is domain-specific.
 
-N_LOGIT = 3  # number of stimuli per category
+N_LOGIT = 20  # number of stimuli per category
 
 logit_signals = {'clinical': [], 'bridge': [], 'factual': []}
 
 for name, stimuli in [
     ('clinical', stim_clinical[:N_LOGIT]),
-    ('bridge', stim_bridge[:N_LOGIT]),
+    ('bridge', stim_bridge[:min(N_LOGIT, len(stim_bridge))]),
     ('factual', stim_factual[:N_LOGIT]),
 ]:
     print(f'Logit lens: {name}...')
@@ -635,10 +712,11 @@ print('A sign flip from positive to negative is the know-but-override pattern.')
 # The key number is the **residual**: what fraction of clinical sycophancy is orthogonal to all measured components.
 
 # For empathy direction: therapeutic (warm+correct) vs cold (correct but cold)
-# We need cold completions -- use clinical_correct_answer which has them
+# We need cold completions -- use stim_clinical_cold which has them
+# (the new validated dataset doesn't include cold completions)
 print('Extracting empathy direction (therapeutic vs cold)...')
 emp_pos_h4, emp_neg_h4 = batch_extract_contrastive(
-    model, tokenizer, stim_clinical[:N_TRAIN],
+    model, tokenizer, stim_clinical_cold[:N_TRAIN],
     'therapeutic_completion', 'cold_completion',
     layers=LAYERS, desc='Empathy'
 )
@@ -651,7 +729,7 @@ dir_empathy = compute_contrastive_direction(emp_pos_h4, emp_neg_h4)
 
 print('Extracting conflict avoidance direction (sycophantic vs cold)...')
 ca_pos, ca_neg = batch_extract_contrastive(
-    model, tokenizer, stim_clinical[:N_TRAIN],
+    model, tokenizer, stim_clinical_cold[:N_TRAIN],
     'sycophantic_completion', 'cold_completion',
     layers=LAYERS, desc='Conflict avoidance'
 )
@@ -871,7 +949,7 @@ for lev in [1, 2, 3]:
     print(f'Level {lev}: {len(grad_by_level[lev])} items')
 
 # Extract activations for each level
-N_GRAD = min(3, min(len(v) for v in grad_by_level.values()))
+N_GRAD = min(len(v) for v in grad_by_level.values())  # use all available per level
 grad_acts = {}
 
 for level in [1, 2, 3]:
@@ -1245,9 +1323,9 @@ results = {
     },
     'stimuli': {
         'clinical': stim_clinical,
+        'clinical_cold': stim_clinical_cold,
         'clinical_clear_answer': stim_clinical_clear,
         'factual': stim_factual,
-        'cognitive_distortions': stim_distort,
         'bridge': stim_bridge,
         'emotional_gradient': stim_gradient,
     },
@@ -1271,6 +1349,12 @@ results = {
         'within_domain_clinical': {str(k): v for k, v in within_clin.items()},
         'within_domain_factual': {str(k): v for k, v in within_fact.items()},
         'permutation_test': perm_result,
+    },
+    'dataset_validation': {
+        'old_vs_new_cosine_by_layer': {str(k): v for k, v in cos_old_new.items()},
+        'old_vs_new_mean_cosine': float(mean_cos_old_new),
+        'split_half_cosine_by_layer': {str(k): v for k, v in cos_split.items()},
+        'split_half_mean_cosine': float(mean_split),
     },
     'per_distortion_breakdown': {
         subcat: {
