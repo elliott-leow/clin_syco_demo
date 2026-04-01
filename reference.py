@@ -618,14 +618,14 @@ except:
 # 
 # We analyze clinical, bridge, and factual stimuli separately to see if the pattern is domain-specific.
 
-N_LOGIT = 20  # number of stimuli per category
+N_LOGIT = 50  # number of stimuli per category (capped by dataset size)
 
 logit_signals = {'clinical': [], 'bridge': [], 'factual': [], 'ambiguous': []}
 
 for name, stimuli in [
     ('clinical', stim_clinical[:N_LOGIT]),
     ('bridge', stim_bridge[:min(N_LOGIT, len(stim_bridge))]),
-    ('factual', stim_factual[:N_LOGIT]),
+    ('factual', stim_factual[:min(N_LOGIT, len(stim_factual))]),
     ('ambiguous', stim_ambiguous[:min(N_LOGIT, len(stim_ambiguous))]),
 ]:
     print(f'Logit lens: {name}...')
