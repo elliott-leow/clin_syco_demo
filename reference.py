@@ -1037,6 +1037,28 @@ print(f'Transition point: ~layer {mid}')
 print(f'Single-layer steering: layer {single_layer}')
 print(f'Multi-layer steering:  layers {steer_layers}')
 
+# Orthogonalize the clinical sycophancy direction against empathy.
+# The raw contrastive direction captures both "agrees with distortion" AND
+# "emotional warmth" since both sycophantic and therapeutic completions are
+# empathic. Subtracting the empathy projection leaves only the pure
+# agreement-vs-correction component, so steering preserves warmth.
+dir_steer = {}
+for l in LAYERS:
+    clin = dir_clinical[l].float()
+    emp = dir_empathy[l].float()
+    # Project clinical onto empathy and subtract
+    proj = (clin @ emp) / (emp @ emp + 1e-8) * emp
+    orthogonal = clin - proj
+    dir_steer[l] = orthogonal / (orthogonal.norm() + 1e-8)
+
+cos_before = F.cosine_similarity(dir_clinical[single_layer].unsqueeze(0),
+                                  dir_empathy[single_layer].unsqueeze(0)).item()
+cos_after = F.cosine_similarity(dir_steer[single_layer].unsqueeze(0),
+                                 dir_empathy[single_layer].unsqueeze(0)).item()
+print(f'\nSteering direction orthogonalized against empathy:')
+print(f'  cos(clinical, empathy) before: {cos_before:+.3f}')
+print(f'  cos(steering, empathy) after:  {cos_after:+.3f}')
+
 # Measure logit shifts at multiple alpha values
 # For each stimulus, run forward pass with steering hook and measure
 # logit(therapeutic_first_token) - logit(sycophantic_first_token)
@@ -1136,12 +1158,12 @@ results_multi = {a: [] for a in alphas}
 for s in tqdm(test_stimuli, desc='Steering'):
     for a in alphas:
         shift_s = measure_logit_shift(
-            model, tokenizer, s, single_layer, dir_clinical, a
+            model, tokenizer, s, single_layer, dir_steer, a
         )
         results_single[a].append(shift_s)
 
         shift_m = measure_multi_layer_shift(
-            model, tokenizer, s, steer_layers, dir_clinical, a
+            model, tokenizer, s, steer_layers, dir_steer, a
         )
         results_multi[a].append(shift_m)
 
@@ -1217,8 +1239,8 @@ for i, s in enumerate(example_stimuli):
         out = model.generate(ids, attention_mask=torch.ones_like(ids), max_new_tokens=100, do_sample=False, pad_token_id=tokenizer.eos_token_id)
     baseline = tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
 
-    # Single-layer steered
-    vec = dir_clinical[single_layer].to(device=device, dtype=dtype)
+    # Single-layer steered (empathy-orthogonalized direction)
+    vec = dir_steer[single_layer].to(device=device, dtype=dtype)
     def hook_single(mod, inp, out, v=vec, a=alpha_gen):
         h = out[0] if isinstance(out, tuple) else out
         h = h.clone()
@@ -1231,10 +1253,10 @@ for i, s in enumerate(example_stimuli):
     handle.remove()
     steered_single = tokenizer.decode(out_s[0][ids.shape[1]:], skip_special_tokens=True)
 
-    # Multi-layer steered
+    # Multi-layer steered (empathy-orthogonalized direction)
     handles = []
     for sl in steer_layers:
-        sv = dir_clinical[sl].to(device=device, dtype=dtype)
+        sv = dir_steer[sl].to(device=device, dtype=dtype)
         def make_h(v, a=alpha_gen / np.sqrt(len(steer_layers))):
             def fn(mod, inp, out):
                 h = out[0] if isinstance(out, tuple) else out
@@ -1283,7 +1305,7 @@ for i, s in enumerate(example_stimuli):
         out = model.generate(ids, attention_mask=torch.ones_like(ids), max_new_tokens=100, do_sample=False, pad_token_id=tokenizer.eos_token_id)
     baseline = tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
 
-    vec = dir_clinical[single_layer].to(device=device, dtype=dtype)
+    vec = dir_steer[single_layer].to(device=device, dtype=dtype)
     def hook_s(mod, inp, out, v=vec, a=alpha_gen):
         h = out[0] if isinstance(out, tuple) else out
         h = h.clone(); h -= a * v
@@ -1296,7 +1318,7 @@ for i, s in enumerate(example_stimuli):
 
     handles = []
     for sl in steer_layers:
-        sv = dir_clinical[sl].to(device=device, dtype=dtype)
+        sv = dir_steer[sl].to(device=device, dtype=dtype)
         def make_h(v, a=alpha_gen / np.sqrt(len(steer_layers))):
             def fn(mod, inp, out):
                 h = out[0] if isinstance(out, tuple) else out
