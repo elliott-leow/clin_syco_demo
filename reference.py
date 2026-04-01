@@ -306,42 +306,16 @@ else:
     print(f'  Cannot reject the null: observed cosine is consistent with random directions.')
 
 # ---
-# ## Dataset validation: old (ambiguous) vs new (validated) directions
+# ## Split-half reliability
 #
-# The old cognitive_distortions.json had an ambiguity: "sycophantic" responses
-# could be read as empathic validation. The new dataset resolves this with
-# expert-validated items and judge_reasoning. We compare the contrastive
-# directions from both datasets to quantify whether the ambiguity mattered.
+# With 300 items (25 per subcategory), we can test whether the contrastive
+# direction is stable by computing it on two random halves and measuring cosine.
 
 print('\n' + '=' * 70)
-print('DATASET VALIDATION: OLD vs NEW DIRECTIONS')
+print('SPLIT-HALF RELIABILITY')
 print('=' * 70)
 
-# Extract direction from old (ambiguous) dataset
-n_old = min(N_TRAIN, len(stim_clinical_cold))
-print(f'\nExtracting old-dataset direction (N={n_old})...')
-old_pos, old_neg = batch_extract_contrastive(
-    model, tokenizer, stim_clinical_cold[:n_old],
-    'sycophantic_completion', 'therapeutic_completion',
-    layers=LAYERS, desc='Old clinical'
-)
-dir_clinical_old = compute_contrastive_direction(old_pos, old_neg)
-
-cos_old_new = cosine_sim_by_layer(dir_clinical_old, dir_clinical)
-mean_cos_old_new = np.mean(list(cos_old_new.values()))
-print(f'Mean cosine(old, new): {mean_cos_old_new:.3f}')
-if mean_cos_old_new > 0.8:
-    print('Old and new directions are closely aligned — the ambiguity did not')
-    print('substantially alter the extracted direction.')
-elif mean_cos_old_new > 0.4:
-    print('Moderate alignment — the validated dataset captures a partially')
-    print('different direction, suggesting the ambiguity introduced noise.')
-else:
-    print('Low alignment — the validated dataset captures a substantially')
-    print('different direction. The old "sycophantic" label was conflating')
-    print('empathic validation with genuinely harmful agreement.')
-
-# Split-half reliability: does the new dataset give a stable direction?
+# Split-half reliability: does the dataset give a stable direction?
 print(f'\nSplit-half reliability (N={N_TRAIN} per half):')
 np.random.seed(42)
 indices = np.random.permutation(min(2 * N_TRAIN, len(stim_clinical)))
@@ -1350,11 +1324,9 @@ results = {
         'within_domain_factual': {str(k): v for k, v in within_fact.items()},
         'permutation_test': perm_result,
     },
-    'dataset_validation': {
-        'old_vs_new_cosine_by_layer': {str(k): v for k, v in cos_old_new.items()},
-        'old_vs_new_mean_cosine': float(mean_cos_old_new),
-        'split_half_cosine_by_layer': {str(k): v for k, v in cos_split.items()},
-        'split_half_mean_cosine': float(mean_split),
+    'split_half_reliability': {
+        'cosine_by_layer': {str(k): v for k, v in cos_split.items()},
+        'mean_cosine': float(mean_split),
     },
     'per_distortion_breakdown': {
         subcat: {
