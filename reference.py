@@ -655,7 +655,6 @@ for name, c, lab in [
     stds = matrix.std(0)
 
     ax.plot(all_layers, means, '-', color=c, label=lab, lw=1.5)
-    ax.fill_between(all_layers, means - stds, means + stds, color=c, alpha=0.12)
 
 ax.axhline(0, color='gray', ls=':', alpha=0.4)
 ax.set(xlabel='Layer', ylabel='log P(therapeutic) - log P(sycophantic)')
