@@ -88,6 +88,7 @@ stim_clinical_clear = load_json(STIM_DIR / 'clinical_correct_answer.json')
 stim_factual = load_json(STIM_DIR / 'factual_control.json')
 stim_bridge = load_json(STIM_DIR / 'clinical_bridge.json')
 stim_gradient = load_json(STIM_DIR / 'emotional_intensity_gradient.json')
+stim_ambiguous = load_json(STIM_DIR / 'ambiguous_medical.json')
 
 print(f'Clinical (validated):    {len(stim_clinical)} items')
 print(f'Clinical (cold-compl):   {len(stim_clinical_cold)} items')
@@ -95,6 +96,7 @@ print(f'Clinical clear-answer:   {len(stim_clinical_clear)} items')
 print(f'Factual controls:       {len(stim_factual)} items')
 print(f'Clinical bridge:         {len(stim_bridge)} items')
 print(f'Emotional gradient:      {len(stim_gradient)} items')
+print(f'Ambiguous medical:       {len(stim_ambiguous)} items')
 
 # ---
 # ## Stimulus Examples
@@ -618,12 +620,13 @@ except:
 
 N_LOGIT = 20  # number of stimuli per category
 
-logit_signals = {'clinical': [], 'bridge': [], 'factual': []}
+logit_signals = {'clinical': [], 'bridge': [], 'factual': [], 'ambiguous': []}
 
 for name, stimuli in [
     ('clinical', stim_clinical[:N_LOGIT]),
     ('bridge', stim_bridge[:min(N_LOGIT, len(stim_bridge))]),
     ('factual', stim_factual[:N_LOGIT]),
+    ('ambiguous', stim_ambiguous[:min(N_LOGIT, len(stim_ambiguous))]),
 ]:
     print(f'Logit lens: {name}...')
     for s in tqdm(stimuli, desc=name):
@@ -644,6 +647,7 @@ for name, c, lab in [
     ('factual', BLUE, 'Factual'),
     ('bridge', PURPLE, 'Bridge'),
     ('clinical', RED, 'Clinical'),
+    ('ambiguous', GREEN, 'Ambiguous medical'),
 ]:
     signals = logit_signals[name]
     matrix = np.array([[s[l] for l in all_layers] for s in signals])
@@ -661,7 +665,7 @@ fig.tight_layout()
 plt.savefig(f"plots/fig{3}.png", dpi=150, bbox_inches="tight"); plt.close()
 
 # Print early vs late signal
-for name in ['clinical', 'bridge', 'factual']:
+for name in ['clinical', 'bridge', 'factual', 'ambiguous']:
     signals = logit_signals[name]
     matrix = np.array([[s[l] for l in all_layers] for s in signals])
     early = matrix[:, :N_LAYERS // 4].mean()
@@ -673,6 +677,11 @@ print()
 print('Positive = model favors therapeutic (correct) answer at that layer.')
 print('Negative = model favors sycophantic answer.')
 print('A sign flip from positive to negative is the know-but-override pattern.')
+print()
+print('Deference vs uncertainty test:')
+print('  If clinical shows override (early+, late-) but ambiguous shows weak signal,')
+print('  then clinical sycophancy is deference (model knows the answer but suppresses it).')
+print('  If both show similar patterns, uncertainty may be the driver.')
 
 # ---
 # ## Supporting analysis: Variance decomposition
@@ -1363,6 +1372,7 @@ results = {
         'factual': stim_factual,
         'bridge': stim_bridge,
         'emotional_gradient': stim_gradient,
+        'ambiguous_medical': stim_ambiguous,
     },
     'behavioral_examples': [
         {
