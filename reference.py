@@ -77,27 +77,43 @@ set_seeds(42)
 
 from pathlib import Path
 
+# v2 dataset: ~2500 expert-validated items (500 per file) generated via a
+# two-step LLM pipeline and independently validated by 10 Claude Code
+# subagents acting as clinical-psychologist reviewers. All 2500 items were
+# checked; 2 items (factual IDs 29, 39) were flagged as broken and are
+# filtered out below. The older 300-item set is kept at data/stimuli/ for
+# the clear-answer and ambiguous-medical subsets, which the v2 pipeline
+# did not regenerate.
+REPO_ROOT = Path('.')
 STIM_DIR = Path('data/stimuli')
 
 def load_json(p):
     with open(p) as f:
         return json.load(f)
 
-stim_clinical = load_json(STIM_DIR / 'clinical_sycophancy_dataset.json')
-stim_clinical_cold = load_json(STIM_DIR / 'cognitive_distortions.json')
+# Filter out the two items flagged as broken during v2 validation
+# (ID 29: user claim is actually historically correct; ID 39: cold_completion
+# is copy-pasted from a different item's topic).
+FACTUAL_BROKEN_IDS = {29, 39}
+
+stim_clinical = load_json(REPO_ROOT / 'v2_clinical_sycophancy.json')
+stim_clinical_cold = load_json(REPO_ROOT / 'v2_clinical_cold.json')
+stim_factual = [s for s in load_json(REPO_ROOT / 'v2_factual_control.json')
+                if s.get('id') not in FACTUAL_BROKEN_IDS]
+stim_bridge = load_json(REPO_ROOT / 'v2_bridge.json')
+stim_gradient = load_json(REPO_ROOT / 'v2_emotional_gradient.json')
+# Kept from the older dataset (not in v2):
 stim_clinical_clear = load_json(STIM_DIR / 'clinical_correct_answer.json')
-stim_factual = load_json(STIM_DIR / 'factual_control.json')
-stim_bridge = load_json(STIM_DIR / 'clinical_bridge.json')
-stim_gradient = load_json(STIM_DIR / 'emotional_intensity_gradient.json')
 stim_ambiguous = load_json(STIM_DIR / 'ambiguous_medical.json')
 
-print(f'Clinical (validated):    {len(stim_clinical)} items')
-print(f'Clinical (cold-compl):   {len(stim_clinical_cold)} items')
-print(f'Clinical clear-answer:   {len(stim_clinical_clear)} items')
-print(f'Factual controls:       {len(stim_factual)} items')
-print(f'Clinical bridge:         {len(stim_bridge)} items')
-print(f'Emotional gradient:      {len(stim_gradient)} items')
-print(f'Ambiguous medical:       {len(stim_ambiguous)} items')
+print(f'Clinical sycophancy (v2):   {len(stim_clinical)} items')
+print(f'Clinical cold (v2):          {len(stim_clinical_cold)} items')
+print(f'Factual controls (v2):       {len(stim_factual)} items '
+      f'(excluded {len(FACTUAL_BROKEN_IDS)} broken)')
+print(f'Clinical bridge (v2):        {len(stim_bridge)} items')
+print(f'Emotional gradient (v2):     {len(stim_gradient)} items')
+print(f'Clinical clear-answer (old): {len(stim_clinical_clear)} items')
+print(f'Ambiguous medical (old):     {len(stim_ambiguous)} items')
 
 # ---
 # ## Stimulus Examples
@@ -190,7 +206,7 @@ print('=' * 70)
 # We also train a linear probe on one domain and test it on the other. Asymmetric transfer (factual-to-clinical works but not vice versa) would mean clinical sycophancy contains dimensions that factual sycophancy doesn't.
 
 # Use N_TRAIN items from each domain for direction computation
-N_TRAIN = 50
+N_TRAIN = 100  # v2 dataset has 500 items per file, so we can use more without exhausting
 
 print('Extracting clinical activations...')
 clin_pos, clin_neg = batch_extract_contrastive(
@@ -1326,7 +1342,8 @@ _diag_transition = _transition_layers[0] if _transition_layers else None
 
 print(f'Preregistered single-layer steering: L{single_layer} (= MID_LAYER)')
 print(f'Preregistered multi-layer steering:  {steer_layers}')
-print(f'Diagnostic (not used for selection): logit-lens transition at L{_diag_transition}')
+_diag_disp = f'L{_diag_transition}' if _diag_transition is not None else '(none found)'
+print(f'Diagnostic (not used for selection): logit-lens transition at {_diag_disp}')
 
 # Orthogonalize the clinical sycophancy direction against empathy.
 # The raw contrastive direction captures both "agrees with distortion" AND
@@ -2200,7 +2217,10 @@ def _summarize(effects_by_layer):
             continue
         mean = float(np.mean(vals))
         sem = float(np.std(vals, ddof=1) / np.sqrt(len(vals)))
-        rng = np.random.RandomState(42)
+        # Per-layer seed so bootstraps are reproducible but NOT correlated
+        # across layers (resetting to seed 42 every layer made all layers
+        # use identical resample indices).
+        rng = np.random.RandomState(42 + int(l))
         boots = [rng.choice(vals, len(vals), replace=True).mean() for _ in range(2000)]
         lo, hi = np.percentile(boots, [2.5, 97.5])
         t_stat, p_val = scipy_stats.ttest_1samp(vals, 0)
@@ -2219,13 +2239,21 @@ print(f'\n  Per-layer ablation effect (clinical vs random vs empathy controls):'
 print(f'  {"Layer":>6}  {"Clin Δ":>9}  {"Rand Δ":>9}  {"Emp Δ":>9}  {"Clin vs Rand p":>14}')
 causal_vs_random_p = {}
 for l in LAYERS:
-    clin_vals = np.array([v for v in causal_effects[l] if not np.isnan(v)])
-    rand_vals = np.array([v for v in control_random[l] if not np.isnan(v)])
-    # Paired t-test: per-item difference
-    diffs = clin_vals - rand_vals
+    # CRITICAL: paired t-test requires ALIGNED pairs. We keep original
+    # arrays full-length and mask jointly (drop only rows where either
+    # value is NaN), preserving per-stimulus correspondence.
+    clin_arr = np.array(causal_effects[l], dtype=float)
+    rand_arr = np.array(control_random[l], dtype=float)
+    mask = ~(np.isnan(clin_arr) | np.isnan(rand_arr))
+    clin_paired = clin_arr[mask]
+    rand_paired = rand_arr[mask]
+    diffs = clin_paired - rand_paired
     t_stat, p_val = scipy_stats.ttest_1samp(diffs, 0) if len(diffs) > 1 else (0.0, 1.0)
-    causal_vs_random_p[str(l)] = {'t_stat': float(t_stat), 'p_value': float(p_val)}
-    emp_mean = float(np.mean([v for v in control_empathy[l] if not np.isnan(v)])) if control_empathy[l] else float('nan')
+    causal_vs_random_p[str(l)] = {'t_stat': float(t_stat), 'p_value': float(p_val),
+                                   'n_paired': int(len(diffs))}
+    emp_arr = np.array(control_empathy[l], dtype=float)
+    emp_valid = emp_arr[~np.isnan(emp_arr)]
+    emp_mean = float(np.mean(emp_valid)) if len(emp_valid) else float('nan')
     sig = '***' if p_val < 0.001 else '**' if p_val < 0.01 else '*' if p_val < 0.05 else ''
     print(f'  {l:>6}  {causal_per_layer[str(l)]["mean"]:>+8.3f}  '
           f'{control_random_per_layer[str(l)]["mean"]:>+8.3f}  '
