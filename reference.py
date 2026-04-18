@@ -1305,7 +1305,11 @@ gradient_stats = {
 # The data-driven transition layer is still computed for diagnostic
 # reporting only — NOT used to pick intervention sites.
 single_layer = MID_LAYER
-steer_layers = [L for L in LAYERS if MID_LAYER - 4 <= L <= MID_LAYER + 4][:4]
+# Pick the 4 sampled layers CLOSEST to MID_LAYER (symmetric-ish window,
+# robust to non-uniform layer sampling). On OLMo-3 7B with MID_LAYER=16
+# and LAYERS=[0,4,8,12,16,20,24,28,31] this gives {12, 16, 20, 8 or 24}.
+steer_layers = sorted(LAYERS, key=lambda L: abs(L - MID_LAYER))[:4]
+steer_layers = sorted(steer_layers)  # ascending for consistent plot/log
 if len(steer_layers) < 3:
     steer_layers = LAYERS[len(LAYERS)//3 : len(LAYERS)*2//3]
 
@@ -1922,14 +1926,48 @@ for cfg in cfg_list:
     print(f'  {cfg:>12}: SYC→NOT={b01}  NOT→SYC={b10}  '
           f'p(1-tail improve)={p_one:.4f}  p(2-tail)={p_two:.4f}')
 
-# Sign-flip validity check
+# Formal monotone-trend test: Cochran-Armitage-style permutation test on the
+# per-stimulus sycophancy indicator across ordered alpha values. This is a
+# proper statistical test of the causal-validity claim "sycophancy rate is
+# monotone in alpha," replacing the previous eyeball heuristic.
+alpha_ordering = [-5, -3, 0, 3, 5]
+# 2-D array: stim × alpha, 1 if judged sycophantic
+_cfg_for_alpha = {a: 'baseline' if a == 0 else f'alpha_{a:+d}' for a in alpha_ordering}
+_syc_mat = np.array([
+    [1 if alpha_verdicts[str(i)][_cfg_for_alpha[a]] == 'sycophantic' else 0
+     for a in alpha_ordering]
+    for i in range(n_alpha)
+])
+# Observed Spearman-like statistic: sum over stimuli of (syc indicator × rank of alpha)
+# Using Kendall's tau on long-format (stim_id, alpha, syc) is equivalent and simpler.
+_long_alphas = np.repeat(alpha_ordering, n_alpha)
+_long_syc = _syc_mat.T.flatten()
+observed_tau, _asymp_p = scipy_stats.kendalltau(_long_alphas, _long_syc)
+# Permutation null: shuffle syc labels within each stimulus (preserves
+# per-stimulus total sycophancy count, tests trend with alpha order)
+_rng_np = np.random.RandomState(42)
+null_taus = []
+for _ in range(2000):
+    perm = _syc_mat.copy()
+    for row_idx in range(perm.shape[0]):
+        _rng_np.shuffle(perm[row_idx])
+    null_taus.append(scipy_stats.kendalltau(
+        _long_alphas, perm.T.flatten()).correlation)
+null_taus = np.array(null_taus)
+p_trend = float(np.mean(np.abs(null_taus) >= abs(observed_tau)))
+
+# Expected direction: alpha INCREASES → sycophancy DECREASES, so tau < 0
+sign_flip_consistent = observed_tau < 0
 neg_alpha_syc = alpha_counts.get('alpha_-5', Counter())['sycophantic']
 pos_alpha_syc = alpha_counts.get('alpha_+5', Counter())['sycophantic']
 base_syc = alpha_counts['baseline']['sycophantic']
-print(f'\n  Sign-flip check: baseline={base_syc}/{n_alpha}  '
+print(f'\n  Causal-validity test: monotone trend of sycophancy with alpha')
+print(f'    Kendall tau (alpha vs syc): {observed_tau:+.3f}')
+print(f'    Expected sign: negative (α↑ → syc↓). '
+      f'Observed direction: {"consistent" if sign_flip_consistent else "inconsistent"}')
+print(f'    Permutation p (2-tailed, n=2000): {p_trend:.4f}')
+print(f'  Point estimates: baseline={base_syc}/{n_alpha}  '
       f'α=+5: {pos_alpha_syc}/{n_alpha}  α=-5: {neg_alpha_syc}/{n_alpha}')
-print(f'  {"PASS" if neg_alpha_syc > base_syc and pos_alpha_syc < base_syc else "FAIL"}: '
-      f'α<0 should INCREASE sycophancy; α>0 should DECREASE.')
 
 fig, ax = plt.subplots(figsize=(8, 4))
 alpha_vals = [-5, -3, 0, 3, 5]
@@ -1960,7 +1998,15 @@ alpha_reversal_summary = {
     'counts_by_alpha': {cfg: dict(alpha_counts[cfg]) for cfg in cfg_list},
     'cochran_Q': Q, 'cochran_p': p_Q,
     'pairwise_mcnemar': mcnemar_alphas,
-    'sign_flip_pass': bool(neg_alpha_syc > base_syc and pos_alpha_syc < base_syc),
+    'trend_test': {
+        'kendall_tau': float(observed_tau),
+        'p_permutation_2tailed': float(p_trend),
+        'expected_sign': 'negative (alpha up → syc down)',
+        'sign_consistent': bool(sign_flip_consistent),
+    },
+    # Retain the old heuristic as a diagnostic only, flagged as such
+    'sign_flip_heuristic_point_estimate': bool(
+        neg_alpha_syc > base_syc and pos_alpha_syc < base_syc),
 }
 
 # ---
@@ -2107,25 +2153,39 @@ control_empathy = {l: [] for l in LAYERS}
 
 device = get_device(model)
 dtype = next(model.parameters()).dtype
+# Pre-cache empathy directions on device
+emp_v_cached = {l: dir_empathy[l].to(device=device, dtype=dtype) for l in LAYERS
+                if l in dir_empathy}
+
+# Random control: for each (stimulus, layer), average the ablation effect over
+# K independent random unit vectors. This gives the EXPECTED null under a
+# proper null distribution, not a single lucky/unlucky draw. K=10 balances
+# cost (10× forward passes per stimulus per layer) against null variance.
+# Without this, the paired t-test of clin-vs-random is against one fixed
+# draw, which undercuts the specificity claim.
+K_RANDOM = 10
 _rng_torch = torch.Generator().manual_seed(42)
-random_dirs = {l: F.normalize(torch.randn(dir_clinical[l].shape, generator=_rng_torch), dim=0).to(device=device, dtype=dtype)
-               for l in LAYERS}
 
 for i, s in enumerate(tqdm(patch_stim, desc='Causal patch')):
     b = baselines_patch[i]
     for l in LAYERS:
         # Main: ablate dir_clinical
         causal_effects[l].append(logit_diff_measure(s, ablate_layer=l) - b)
-        # Control 1: ablate random unit direction of equal norm
-        control_random[l].append(logit_diff_measure(
-            s, ablate_layer=l, ablate_direction=random_dirs[l]) - b)
-        # Control 2: ablate empathy direction at same layer
-        if l in dir_empathy:
-            emp_v = dir_empathy[l].to(device=device, dtype=dtype)
-            control_empathy[l].append(logit_diff_measure(
-                s, ablate_layer=l, ablate_direction=emp_v) - b)
-        else:
-            control_empathy[l].append(float('nan'))
+        # Control 1: mean ablation effect over K independent random unit
+        # directions. Each draw is a fresh sample; averaging converges on the
+        # expected null effect.
+        rand_effects = []
+        for _ in range(K_RANDOM):
+            rv = F.normalize(
+                torch.randn(dir_clinical[l].shape, generator=_rng_torch),
+                dim=0,
+            ).to(device=device, dtype=dtype)
+            rand_effects.append(logit_diff_measure(
+                s, ablate_layer=l, ablate_direction=rv) - b)
+        control_random[l].append(float(np.mean(rand_effects)))
+        # Control 2: ablate empathy direction (always defined on LAYERS)
+        control_empathy[l].append(logit_diff_measure(
+            s, ablate_layer=l, ablate_direction=emp_v_cached[l]) - b)
     if (i + 1) % 3 == 0:
         cleanup()
 
@@ -2338,7 +2398,8 @@ results = {
         },
     },
     'steering': {
-        'transition_layer': mid,
+        'preregistered_layer': int(MID_LAYER),
+        'diagnostic_transition_layer': _diag_transition,
         'single_layer': single_layer,
         'multi_layers': steer_layers,
         'alpha_gen': alpha_gen,
