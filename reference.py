@@ -398,6 +398,9 @@ subcat_results = {}
 test_layer = LAYERS[len(LAYERS) // 2]  # median layer for comparisons
 print(f'\nUsing layer {test_layer} for direction comparisons\n')
 
+subcat_acts = {}  # subtype -> (pos_list, neg_list) preserved for geometric analysis
+subcat_dirs = {}  # subtype -> {layer: unit vector}
+
 for subcat in sorted(subcat_stimuli.keys()):
     items = subcat_stimuli[subcat]
     n_items = min(len(items), N_TRAIN)
@@ -419,6 +422,18 @@ for subcat in sorted(subcat_stimuli.keys()):
         dir_clinical[test_layer].unsqueeze(0)
     ).item()
 
+    # Per-layer cosine with overall clinical direction
+    cos_per_layer = {l: F.cosine_similarity(
+        dir_sc[l].unsqueeze(0), dir_clinical[l].unsqueeze(0)).item() for l in LAYERS}
+
+    # Per-item projection onto overall clinical direction (normalized item-level diff)
+    per_item_proj = {l: [] for l in LAYERS}
+    for pi, ni in zip(sc_pos, sc_neg):
+        for l in LAYERS:
+            diff = F.normalize(pi[l] - ni[l], dim=0)
+            per_item_proj[l].append(F.cosine_similarity(
+                diff.unsqueeze(0), dir_clinical[l].unsqueeze(0)).item())
+
     # Generate a behavioral example
     prompt = format_prompt(tokenizer, items[0]['user_prompt'])
     ids = tokenizer.encode(prompt, return_tensors='pt').to(get_device(model))
@@ -431,9 +446,14 @@ for subcat in sorted(subcat_stimuli.keys()):
     subcat_results[subcat] = {
         'n_items': n_items,
         'cos_with_clinical': cos_with_clin,
+        'cos_per_layer': cos_per_layer,
+        'per_item_proj_by_layer': per_item_proj,
         'example_prompt': items[0]['user_prompt'][:80],
         'example_response': response[:150],
     }
+    subcat_acts[subcat] = (sc_pos, sc_neg)
+    subcat_dirs[subcat] = dir_sc
+    cleanup()
 
 # Print results sorted by cosine (highest alignment with clinical sycophancy first)
 print(f'\n{"Distortion type":<25} {"N":>3} {"cos(sub, clin)":>14}')
@@ -463,6 +483,168 @@ ax.axvline(0, color='gray', ls=':', alpha=0.4)
 ax.invert_yaxis()
 fig.tight_layout()
 plt.savefig("plots/fig_distortion_breakdown.png", dpi=150, bbox_inches="tight"); plt.close()
+
+# ---
+# ## Geometry of the clinical sycophancy subspace
+#
+# Three views of how individual cognitive distortions occupy the clinical
+# sycophancy subspace:
+#
+# 1. **Per-item projection distribution per subtype** (violin plot at
+#    preregistered layer): shows the SPREAD of individual items within each
+#    subtype. A tight positive cluster → the subtype lies cleanly on the
+#    direction. A wide or near-zero distribution → the subtype is orthogonal
+#    or noisy. Includes a bootstrap CI on the mean for each subtype.
+#
+# 2. **Per-layer heatmap** (subtype × layer): how alignment of each subtype's
+#    direction with the overall clinical direction evolves through the
+#    network. Shows whether some subtypes "emerge" later than others.
+#
+# 3. **Pairwise subtype cosine matrix** (12 × 12): are all subtypes near the
+#    same direction (one unified subspace), or do they fan out (multiple
+#    sub-directions within clinical sycophancy)? Also shown: leading
+#    eigenvalue spectrum of the pairwise-cosine Gram matrix — a single
+#    dominant eigenvalue means unified; many comparable eigenvalues means
+#    fragmented subspace.
+
+print('\n' + '=' * 70)
+print('GEOMETRY OF THE CLINICAL SYCOPHANCY SUBSPACE')
+print('=' * 70)
+
+# --- Plot A: per-item projection distributions (violin + bootstrap CI on means)
+# Preregistered layer for cleaner distribution visualization
+sorted_by_cos = sorted(subcat_results.items(),
+                       key=lambda x: -x[1]['cos_with_clinical'])
+sub_names = [s for s, _ in sorted_by_cos]
+projs_by_subcat = {s: subcat_results[s]['per_item_proj_by_layer'][MID_LAYER]
+                   for s in sub_names}
+
+fig, ax = plt.subplots(figsize=(12, 5))
+positions = np.arange(len(sub_names))
+bplot = ax.violinplot(
+    [projs_by_subcat[s] for s in sub_names],
+    positions=positions, widths=0.7, showmeans=False, showmedians=False,
+    showextrema=False,
+)
+# Color each violin
+for i, pc in enumerate(bplot['bodies']):
+    c = subcat_results[sub_names[i]]['cos_with_clinical']
+    color = RED if c > 0.3 else ORANGE if c > 0.1 else BLUE
+    pc.set_facecolor(color); pc.set_alpha(0.55); pc.set_edgecolor('black')
+
+# Overlay per-item dots
+for i, s in enumerate(sub_names):
+    vals = projs_by_subcat[s]
+    jitter = np.random.RandomState(i).uniform(-0.08, 0.08, size=len(vals))
+    ax.scatter(positions[i] + jitter, vals, s=14, alpha=0.55,
+               color='black', zorder=3)
+
+# Mean + 95% bootstrap CI
+for i, s in enumerate(sub_names):
+    vals = np.array(projs_by_subcat[s])
+    ci = bootstrap_ci(list(vals))
+    ax.errorbar(positions[i], ci['mean'],
+                yerr=[[ci['mean']-ci['ci_lo']], [ci['ci_hi']-ci['mean']]],
+                fmt='o', color='white', markeredgecolor='black',
+                markersize=9, capsize=5, lw=2, zorder=4)
+
+ax.axhline(0, color='gray', ls=':', alpha=0.5)
+ax.set_xticks(positions)
+ax.set_xticklabels(sub_names, rotation=35, ha='right', fontsize=9)
+ax.set_ylabel(f'cos(item-level syc−ther, overall clinical dir) @ L{MID_LAYER}')
+ax.set_title(f'Per-item projection distribution per distortion subtype '
+             f'(violin + white = mean with 95% bootstrap CI)')
+fig.tight_layout()
+plt.savefig('plots/fig12_subspace_item_distributions.png',
+            dpi=150, bbox_inches='tight'); plt.close()
+
+# --- Plot B: per-layer heatmap (subtype × layer)
+fig, ax = plt.subplots(figsize=(11, 6))
+mat = np.array([[subcat_results[s]['cos_per_layer'][l] for l in LAYERS]
+                for s in sub_names])
+vmax = max(abs(mat.min()), abs(mat.max()))
+im = ax.imshow(mat, cmap='RdBu_r', aspect='auto', vmin=-vmax, vmax=vmax)
+ax.set_xticks(range(len(LAYERS)))
+ax.set_xticklabels(LAYERS)
+ax.set_yticks(range(len(sub_names)))
+ax.set_yticklabels(sub_names, fontsize=9)
+ax.set(xlabel='Layer',
+       title='Subtype-direction alignment with overall clinical direction by layer')
+# Mark preregistered layer
+mid_col = LAYERS.index(MID_LAYER)
+ax.axvline(mid_col, color='black', lw=1, ls='--', alpha=0.6)
+cbar = fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
+cbar.set_label('cosine similarity')
+# Annotate cells
+for i in range(mat.shape[0]):
+    for j in range(mat.shape[1]):
+        ax.text(j, i, f'{mat[i, j]:.2f}', ha='center', va='center',
+                fontsize=7, color='black' if abs(mat[i, j]) < 0.5 else 'white')
+fig.tight_layout()
+plt.savefig('plots/fig13_subspace_heatmap.png',
+            dpi=150, bbox_inches='tight'); plt.close()
+
+# --- Plot C: pairwise subtype-direction cosine matrix at preregistered layer
+n_sub = len(sub_names)
+pairwise = np.zeros((n_sub, n_sub))
+for i, a in enumerate(sub_names):
+    for j, b in enumerate(sub_names):
+        pairwise[i, j] = F.cosine_similarity(
+            subcat_dirs[a][MID_LAYER].unsqueeze(0),
+            subcat_dirs[b][MID_LAYER].unsqueeze(0)).item()
+
+# Eigenspectrum of the (Gram-like) pairwise cosine matrix tells us how
+# many independent sub-directions are inside the clinical sycophancy subspace
+eigvals = np.linalg.eigvalsh(pairwise)
+eigvals_sorted = np.sort(eigvals)[::-1]
+effective_rank = float(np.sum(eigvals_sorted) ** 2 / np.sum(eigvals_sorted ** 2))
+print(f'\n  Pairwise subtype-direction matrix @ L{MID_LAYER}:')
+print(f'    Effective rank (participation ratio): {effective_rank:.2f} / {n_sub}')
+print(f'    Top-3 eigenvalue fraction: '
+      f'{eigvals_sorted[:3].sum() / eigvals_sorted.sum():.1%}')
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5.5),
+                         gridspec_kw={'width_ratios': [2, 1]})
+ax = axes[0]
+im = ax.imshow(pairwise, cmap='RdBu_r', vmin=-1, vmax=1, aspect='equal')
+ax.set_xticks(range(n_sub)); ax.set_yticks(range(n_sub))
+ax.set_xticklabels(sub_names, rotation=45, ha='right', fontsize=8)
+ax.set_yticklabels(sub_names, fontsize=8)
+ax.set_title(f'Pairwise cosine between subtype directions @ L{MID_LAYER}')
+for i in range(n_sub):
+    for j in range(n_sub):
+        ax.text(j, i, f'{pairwise[i, j]:.2f}', ha='center', va='center',
+                fontsize=6.5,
+                color='white' if abs(pairwise[i, j]) > 0.5 else 'black')
+fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02).set_label('cosine similarity')
+
+ax = axes[1]
+xs = np.arange(1, len(eigvals_sorted) + 1)
+ax.bar(xs, eigvals_sorted, color=BLUE, edgecolor='black')
+ax.axhline(0, color='gray', ls=':')
+ax.set(xlabel='Eigenvalue rank', ylabel='Eigenvalue',
+       title=f'Eigenspectrum (effective rank={effective_rank:.2f})')
+
+fig.tight_layout()
+plt.savefig('plots/fig14_subspace_pairwise.png',
+            dpi=150, bbox_inches='tight'); plt.close()
+
+subspace_geometry_summary = {
+    'test_layer': int(MID_LAYER),
+    'per_subtype_mean_proj': {s: float(np.mean(projs_by_subcat[s]))
+                               for s in sub_names},
+    'per_subtype_std_proj': {s: float(np.std(projs_by_subcat[s]))
+                              for s in sub_names},
+    'per_subtype_proj_ci': {s: bootstrap_ci(list(projs_by_subcat[s]))
+                             for s in sub_names},
+    'per_layer_alignment': {s: subcat_results[s]['cos_per_layer']
+                             for s in sub_names},
+    'pairwise_matrix': {sub_names[i]: {sub_names[j]: float(pairwise[i, j])
+                                         for j in range(n_sub)}
+                        for i in range(n_sub)},
+    'eigenvalues_sorted': [float(x) for x in eigvals_sorted],
+    'effective_rank_participation_ratio': float(effective_rank),
+}
 
 print('\nRed = strongly aligned (>0.3), Orange = moderate (>0.1), Blue = weak/opposed')
 
