@@ -683,9 +683,11 @@ for stage, model_id in CHECKPOINTS.items():
     print(f'\n--- {stage.upper()} ({model_id}) ---')
     t0 = time.time()
 
+    # bfloat16 + sdpa: 7B model fits in ~14 GB VRAM vs ~28 GB in fp32
     mdl = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=torch.float32,
-        attn_implementation='eager', low_cpu_mem_usage=True
+        model_id, torch_dtype=torch.bfloat16,
+        attn_implementation='sdpa', low_cpu_mem_usage=True,
+        device_map='auto',
     )
     mdl.eval()
     tok = AutoTokenizer.from_pretrained(model_id)
@@ -1044,7 +1046,7 @@ else:
 # (directions are most interpretable in later layers where they're closer to output)
 # Pick the layer where the direction projects most strongly onto vocabulary
 # (strongest max projection magnitude) rather than hardcoded 66% depth
-unembed = model.lm_head.weight.float().cpu()  # (vocab_size, hidden_dim)
+unembed = model.lm_head.weight.detach().cpu().float()  # (vocab_size, hidden_dim); cpu-first avoids GPU fp32 spike
 best_layer, best_mag = None, 0
 for l in LAYERS:
     proj = unembed @ dir_clinical[l].float()
