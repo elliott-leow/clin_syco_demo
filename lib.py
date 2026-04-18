@@ -99,6 +99,131 @@ def bootstrap_ci(values, n_boot=2000, ci=0.95, seed=SEED):
     }
 
 
+# --- error bar helpers ---
+
+def bootstrap_cosine_ci_by_layer(pos_a, neg_a, pos_b, neg_b, layers,
+                                  n_boot=200, ci=0.95, seed=SEED):
+    """Bootstrap CI on cosine similarity between two contrastive directions.
+
+    Resamples stimuli pairs with replacement, recomputes both directions,
+    and measures cosine at each layer. This captures uncertainty in the
+    direction estimates from finite stimuli — the most relevant source of
+    error for direction comparison plots.
+    """
+    rng = np.random.RandomState(seed)
+    n_a, n_b = len(pos_a), len(pos_b)
+    boot = {l: [] for l in layers}
+    for _ in range(n_boot):
+        ia = rng.choice(n_a, n_a, replace=True)
+        ib = rng.choice(n_b, n_b, replace=True)
+        da = compute_contrastive_direction([pos_a[i] for i in ia],
+                                           [neg_a[i] for i in ia])
+        db = compute_contrastive_direction([pos_b[i] for i in ib],
+                                           [neg_b[i] for i in ib])
+        for l in layers:
+            boot[l].append(F.cosine_similarity(
+                da[l].unsqueeze(0), db[l].unsqueeze(0)).item())
+    alpha = (1 - ci) / 2
+    return {l: {"mean": float(np.mean(boot[l])),
+                "lo": float(np.percentile(boot[l], alpha * 100)),
+                "hi": float(np.percentile(boot[l], (1 - alpha) * 100))}
+            for l in layers}
+
+
+def bootstrap_probe_ci(src_pos, src_neg, tgt_pos, tgt_neg, layers,
+                        n_boot=200, ci=0.95, seed=SEED):
+    """Bootstrap CI on cross-domain probe accuracy.
+
+    Resamples training set with replacement, retrains probe, evaluates on
+    full test set. This captures uncertainty from finite training data —
+    the dominant error source for probe transfer.
+    """
+    rng = np.random.RandomState(seed)
+    n_src = len(src_pos)
+    boot = {l: [] for l in layers}
+    for _ in range(n_boot):
+        idx = rng.choice(n_src, n_src, replace=True)
+        sp = [src_pos[i] for i in idx]
+        sn = [src_neg[i] for i in idx]
+        for l in layers:
+            Xtr = np.concatenate([np.stack([a[l].numpy() for a in sp]),
+                                   np.stack([a[l].numpy() for a in sn])])
+            ytr = np.concatenate([np.ones(len(sp)), np.zeros(len(sn))])
+            Xte = np.concatenate([np.stack([a[l].numpy() for a in tgt_pos]),
+                                   np.stack([a[l].numpy() for a in tgt_neg])])
+            yte = np.concatenate([np.ones(len(tgt_pos)),
+                                  np.zeros(len(tgt_neg))])
+            clf = LogisticRegression(max_iter=1000, solver="lbfgs")
+            try:
+                clf.fit(Xtr, ytr)
+                boot[l].append(accuracy_score(yte, clf.predict(Xte)))
+            except Exception:
+                pass
+    alpha = (1 - ci) / 2
+    return {l: {"mean": float(np.mean(boot[l])) if boot[l] else float("nan"),
+                "lo": float(np.percentile(boot[l], alpha * 100)) if boot[l] else float("nan"),
+                "hi": float(np.percentile(boot[l], (1 - alpha) * 100)) if boot[l] else float("nan")}
+            for l in layers}
+
+
+def bootstrap_decomp_ci_by_layer(target_pos, target_neg,
+                                  comp_pos_neg_dict, layers,
+                                  n_boot=200, ci=0.95, seed=SEED):
+    """Bootstrap CI on variance-explained from direction decomposition.
+
+    Resamples stimuli, recomputes target + all component directions,
+    runs decomposition. Returns per-layer, per-component CIs on unique
+    variance explained and residual.
+    """
+    rng = np.random.RandomState(seed)
+    n = len(target_pos)
+    comp_names = list(comp_pos_neg_dict.keys())
+    boot = {l: {c: [] for c in comp_names + ["residual"]} for l in layers}
+    for _ in range(n_boot):
+        idx = rng.choice(n, n, replace=True)
+        tp = [target_pos[i] for i in idx]
+        tn = [target_neg[i] for i in idx]
+        td = compute_contrastive_direction(tp, tn)
+        cds = {}
+        for c in comp_names:
+            cp, cn = comp_pos_neg_dict[c]
+            ci_idx = rng.choice(len(cp), len(cp), replace=True)
+            cds[c] = compute_contrastive_direction(
+                [cp[i] for i in ci_idx], [cn[i] for i in ci_idx])
+        dec = decompose_by_layer(td, cds)
+        for l in layers:
+            if l not in dec:
+                continue
+            for c in comp_names:
+                boot[l][c].append(
+                    dec[l]["unique_variance_explained"].get(c, 0))
+            boot[l]["residual"].append(
+                dec[l]["residual_variance_fraction"])
+    al = (1 - ci) / 2
+    result = {}
+    for l in layers:
+        result[l] = {}
+        for c in comp_names + ["residual"]:
+            vals = boot[l][c]
+            if vals:
+                result[l][c] = {
+                    "mean": float(np.mean(vals)),
+                    "lo": float(np.percentile(vals, al * 100)),
+                    "hi": float(np.percentile(vals, (1 - al) * 100))}
+            else:
+                result[l][c] = {"mean": 0, "lo": 0, "hi": 0}
+    return result
+
+
+def plot_with_ci(ax, x, ci_dict, color, label, ls='-', lw=1.5):
+    """Plot a line with shaded 95% CI band from bootstrap_*_ci_by_layer output."""
+    means = [ci_dict[l]["mean"] for l in x]
+    lo = [ci_dict[l]["lo"] for l in x]
+    hi = [ci_dict[l]["hi"] for l in x]
+    ax.plot(x, means, ls, color=color, label=label, lw=lw)
+    ax.fill_between(x, lo, hi, color=color, alpha=0.15)
+
+
 # --- activation extraction ---
 
 @torch.no_grad()
