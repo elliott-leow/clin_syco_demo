@@ -18,7 +18,10 @@ import os
 # Install dependencies and define all helper functions inline.
 
 # COLAB: install deps. transformers >= 4.57 is required for OLMo-3 support.
-# COLAB: !pip install -q -U "transformers>=4.57.0" accelerate "scipy>=1.11" scikit-learn numpy matplotlib tqdm
+# IMPORTANT: do NOT -U numpy/scipy/sklearn/matplotlib/tqdm. Colab pins them
+# for numba (numpy<2.1) and tensorflow (numpy<2.2) compatibility. Upgrading
+# numpy breaks those and creates a dependency-resolution error.
+# COLAB: !pip install -q "transformers>=4.57.0" accelerate
 
 import gc, json, os, time, shutil
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
