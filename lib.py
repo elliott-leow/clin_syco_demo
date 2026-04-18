@@ -365,11 +365,15 @@ def permutation_test_cosine(pos_a, neg_a, pos_b, neg_b, layer, n_perms=1000,
 
     p_value = float(np.mean([abs(nc) >= abs(observed) for nc in null_cos]))
     null_std = float(np.std(null_cos))
-    effect_size = (observed - float(np.mean(null_cos))) / null_std if null_std > 0 else 0
+    # NOTE: This is a z-score against the permutation null, NOT Cohen's d
+    # (Cohen's d requires pooled SD between two groups). Field `cohens_d` is
+    # kept for backward compat but is an alias of `null_z`.
+    null_z = (observed - float(np.mean(null_cos))) / null_std if null_std > 0 else 0
     return {"observed": observed, "p_value": p_value,
             "null_mean": float(np.mean(null_cos)),
             "null_std": null_std,
-            "cohens_d": effect_size}
+            "null_z": null_z,
+            "cohens_d": null_z}  # deprecated alias
 
 
 # --- probing ---

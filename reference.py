@@ -17,7 +17,8 @@ import os
 # 
 # Install dependencies and define all helper functions inline.
 
-# COLAB: !pip install -q transformers accelerate numpy scikit-learn matplotlib tqdm
+# COLAB: install deps. transformers >= 4.57 is required for OLMo-3 support.
+# COLAB: !pip install -q -U "transformers>=4.57.0" accelerate "scipy>=1.11" scikit-learn numpy matplotlib tqdm
 
 import gc, json, os, time, shutil
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -593,15 +594,25 @@ for i, a in enumerate(sub_names):
             subcat_dirs[a][MID_LAYER].unsqueeze(0),
             subcat_dirs[b][MID_LAYER].unsqueeze(0)).item()
 
-# Eigenspectrum of the (Gram-like) pairwise cosine matrix tells us how
-# many independent sub-directions are inside the clinical sycophancy subspace
-eigvals = np.linalg.eigvalsh(pairwise)
-eigvals_sorted = np.sort(eigvals)[::-1]
+# Participation ratio is defined for spectra of PSD matrices. A cosine
+# matrix is NOT guaranteed PSD. Compute the participation ratio on the true
+# Gram matrix D @ D.T where D stacks the 12 unit direction vectors — this
+# IS PSD by construction. The cosine matrix above is kept for the heatmap
+# visualization but not used for dimensionality estimation.
+D = np.stack([subcat_dirs[s][MID_LAYER].float().numpy() for s in sub_names])
+gram = D @ D.T  # (n_sub, n_sub), PSD by construction, cos(i,j)·||d_i||·||d_j|| = cos (d's are unit)
+# Note: since all d_i are already unit-normalized, gram == pairwise numerically,
+# but eigvalues(gram) is computed via SVD path for numerical PSD guarantees.
+svals = np.linalg.svd(D, compute_uv=False)  # singular values of D
+eigvals_sorted = (svals ** 2)  # eigenvalues of D D^T (all ≥ 0)
 effective_rank = float(np.sum(eigvals_sorted) ** 2 / np.sum(eigvals_sorted ** 2))
-print(f'\n  Pairwise subtype-direction matrix @ L{MID_LAYER}:')
+print(f'\n  Subtype-direction Gram matrix @ L{MID_LAYER} (PSD):')
 print(f'    Effective rank (participation ratio): {effective_rank:.2f} / {n_sub}')
 print(f'    Top-3 eigenvalue fraction: '
       f'{eigvals_sorted[:3].sum() / eigvals_sorted.sum():.1%}')
+# Kept for reference (may have negative values — informational only):
+_cos_eigvals = np.sort(np.linalg.eigvalsh(pairwise))[::-1]
+print(f'    (Cosine-matrix eigvals, may be negative: min={_cos_eigvals.min():.3f})')
 
 fig, axes = plt.subplots(1, 2, figsize=(14, 5.5),
                          gridspec_kw={'width_ratios': [2, 1]})
@@ -695,14 +706,21 @@ for stage, model_id in CHECKPOINTS.items():
         tok.pad_token = tok.eos_token
     print(f'  Loaded in {time.time() - t0:.0f}s, VRAM: {vram():.1f} GB')
 
+    # Each checkpoint gets its NATIVE input format: base model has no chat
+    # template and was trained on raw text; SFT/DPO were trained with a chat
+    # template. Forcing a single format across all three would confound the
+    # training-stage effect with a template-distribution-shift effect on
+    # the instruct-tuned models. `format_prompt` in lib.py falls back to raw
+    # text automatically when chat_template is absent.
+    use_ct = bool(getattr(tok, 'chat_template', None))
+    print(f'  Using chat_template = {use_ct}')
+
     # Empathy direction: therapeutic (warm) vs cold
-    # use_chat_template=False for controlled cross-checkpoint comparison
-    # (base model may lack a chat template, which would confound results)
     emp_pos, emp_neg = batch_extract_contrastive(
         mdl, tok, h2_stimuli,
         'therapeutic_completion', 'cold_completion',
         layers=LAYERS, desc=f'{stage} empathy',
-        use_chat_template=False
+        use_chat_template=use_ct
     )
     dir_emp = compute_contrastive_direction(emp_pos, emp_neg)
 
@@ -711,7 +729,7 @@ for stage, model_id in CHECKPOINTS.items():
         mdl, tok, h2_stimuli,
         'sycophantic_completion', 'therapeutic_completion',
         layers=LAYERS, desc=f'{stage} sycophancy',
-        use_chat_template=False
+        use_chat_template=use_ct
     )
     dir_syc = compute_contrastive_direction(syc_pos, syc_neg)
 
@@ -730,7 +748,10 @@ for stage, model_id in CHECKPOINTS.items():
 
     del mdl, tok, emp_pos, emp_neg, syc_pos, syc_neg, dir_emp, dir_syc
     cleanup()
-    clear_hf_cache(model_id)
+    # Don't clear cache for the DPO checkpoint — it's reloaded immediately after H3.
+    # Clearing + re-downloading would waste ~14 GB and 5-10 min.
+    if model_id != MODEL_DPO:
+        clear_hf_cache(model_id)
 
 print('\nAll checkpoints processed.')
 
@@ -984,7 +1005,7 @@ resid = [decomp_2[l]['residual_variance_fraction'] for l in x]
 ax1.stackplot(x, emp_ve, fact_ve, resid,
               labels=['Empathy', 'Factual agreement', 'Unexplained'],
               colors=[ORANGE, BLUE, GRAY], alpha=0.85)
-ax1.set(xlabel='Layer', ylabel='Variance fraction', ylim=(0, 1.05))
+ax1.set(xlabel='Layer', ylabel='Squared cosine alignment with component', ylim=(0, 1.05))
 ax1.set_title('2-component decomposition by layer')
 ax1.legend(loc='center right', fontsize=8)
 
@@ -1006,8 +1027,8 @@ colors_5.append(GRAY)
 bars = ax2.barh(range(len(labels_5)), mean_ve_5, color=colors_5, height=0.6)
 ax2.set_yticks(range(len(labels_5)))
 ax2.set_yticklabels(labels_5)
-ax2.set(xlabel='Variance explained')
-ax2.set_title('5-component decomposition (mean across layers)')
+ax2.set(xlabel='Unique squared cosine alignment (order-dependent)')
+ax2.set_title('5-component decomposition — NOTE: order-dependent Gram-Schmidt')
 for bar, v in zip(bars, mean_ve_5):
     ax2.text(bar.get_width() + 0.008, bar.get_y() + bar.get_height() / 2,
              f'{v:.1%}', va='center', fontsize=8)
@@ -1043,19 +1064,24 @@ else:
 # This is the "microscope" into what the direction actually represents in token space.
 
 # Pick a mid-to-late layer where the direction is most meaningful
-# (directions are most interpretable in later layers where they're closer to output)
-# Pick the layer where the direction projects most strongly onto vocabulary
-# (strongest max projection magnitude) rather than hardcoded 66% depth
+# PREREGISTERED layer: use MID_LAYER for vocabulary decoding. The earlier
+# "layer with strongest projection onto vocab" choice was a post-hoc
+# statistic of the same data used for interpretation — the
+# feelings-vs-facts narrative could be supported by any layer you cherry-
+# pick via argmax. Using the preregistered median layer keeps the claim
+# honest. We also print the diagnostic "strongest-projection" layer for
+# transparency.
 unembed = model.lm_head.weight.detach().cpu().float()  # (vocab_size, hidden_dim); cpu-first avoids GPU fp32 spike
-best_layer, best_mag = None, 0
+_diag_best_layer, _diag_best_mag = None, 0
 for l in LAYERS:
-    proj = unembed @ dir_clinical[l].float()
-    mag = proj.abs().max().item()
-    if mag > best_mag:
-        best_mag = mag
-        best_layer = l
-target_layer = best_layer
-print(f'Analyzing direction at layer {target_layer} (strongest projection: {best_mag:.3f})')
+    _proj = unembed @ dir_clinical[l].float()
+    _mag = _proj.abs().max().item()
+    if _mag > _diag_best_mag:
+        _diag_best_mag = _mag
+        _diag_best_layer = l
+target_layer = MID_LAYER
+print(f'Analyzing direction at preregistered layer L{target_layer} '
+      f'(diagnostic: strongest projection was at L{_diag_best_layer}, mag={_diag_best_mag:.3f})')
 
 # Project the clinical sycophancy direction through unembedding
 direction = dir_clinical[target_layer].float()
@@ -1270,42 +1296,33 @@ gradient_stats = {
 # 
 # We also generate text examples to qualitatively assess the steering effect.
 
-# Identify causally important layers via logit lens peak
-# The layers where the signal flips from therapeutic to sycophantic
-# are the ones doing the "override" -- good steering targets
+# PREREGISTERED layer selection. We use the median of the sampled layers
+# (MID_LAYER) as the "single layer" steering target, and a symmetric window
+# around it as the multi-layer target. This avoids data-snooping from the
+# earlier logit-lens-transition-based choice, which was a statistic of the
+# same data used for evaluation.
+#
+# The data-driven transition layer is still computed for diagnostic
+# reporting only — NOT used to pick intervention sites.
+single_layer = MID_LAYER
+steer_layers = [L for L in LAYERS if MID_LAYER - 4 <= L <= MID_LAYER + 4][:4]
+if len(steer_layers) < 3:
+    steer_layers = LAYERS[len(LAYERS)//3 : len(LAYERS)*2//3]
 
-# Aggregate logit lens signal
+# Diagnostic only: where does the logit-lens signal transition?
 clin_matrix = np.array([
     [s[l] for l in all_layers] for s in logit_signals['clinical']
 ])
 mean_signal = clin_matrix.mean(0)
-
-# Find layers where signal transitions from positive to negative
-# (therapeutic -> sycophantic)
-# Skip early layers (first half) — logit lens is noisy there and
-# early layers handle low-level processing, not semantic reasoning.
-min_layer = N_LAYERS // 2
-transition_layers = []
+_transition_layers = []
 for i in range(1, len(all_layers)):
-    if all_layers[i] >= min_layer and mean_signal[i-1] > 0 and mean_signal[i] <= 0:
-        transition_layers.append(all_layers[i])
+    if all_layers[i] >= N_LAYERS // 2 and mean_signal[i-1] > 0 and mean_signal[i] <= 0:
+        _transition_layers.append(all_layers[i])
+_diag_transition = _transition_layers[0] if _transition_layers else None
 
-# Pick steering layers: around the transition + some spread
-if transition_layers:
-    mid = transition_layers[0]
-else:
-    mid = N_LAYERS * 2 // 3  # fallback: 66% depth
-
-# Multi-layer: 4 layers around the transition
-steer_candidates = [l for l in LAYERS if abs(l - mid) <= 6]
-if len(steer_candidates) < 3:
-    steer_candidates = LAYERS[len(LAYERS)//3 : len(LAYERS)*2//3]
-steer_layers = steer_candidates[:4]
-single_layer = steer_layers[len(steer_layers) // 2]
-
-print(f'Transition point: ~layer {mid}')
-print(f'Single-layer steering: layer {single_layer}')
-print(f'Multi-layer steering:  layers {steer_layers}')
+print(f'Preregistered single-layer steering: L{single_layer} (= MID_LAYER)')
+print(f'Preregistered multi-layer steering:  {steer_layers}')
+print(f'Diagnostic (not used for selection): logit-lens transition at L{_diag_transition}')
 
 # Orthogonalize the clinical sycophancy direction against empathy.
 # The raw contrastive direction captures both "agrees with distortion" AND
@@ -1807,7 +1824,7 @@ mcnemar_summary = {
 alphas_reversal = [-5, -3, 0, +3, +5]
 
 alpha_gens = []
-N_ALPHA_TEST = min(15, len(test_stimuli))
+N_ALPHA_TEST = min(30, len(test_stimuli))  # raised from 15 to improve McNemar power
 for i, s in enumerate(tqdm(test_stimuli[:N_ALPHA_TEST], desc='Alpha sweep')):
     row = {'stim_id': i, 'subcategory': s.get('subcategory', ''),
            'user_prompt': s['user_prompt'], 'responses': {}}
@@ -2034,9 +2051,13 @@ specificity_summary = {
 #
 # **Errors**: Bootstrap 95% CI on per-layer mean effect + one-sample t-test.
 
-def logit_diff_measure(stimulus, ablate_layer=None):
+def logit_diff_measure(stimulus, ablate_layer=None, ablate_direction=None):
     """logP(therapeutic_tok) - logP(sycophantic_tok) at final prompt token.
-    If ablate_layer: null-space projection of dir_clinical[L] at that layer."""
+
+    If ablate_direction is None and ablate_layer is set, defaults to
+    dir_clinical[ablate_layer]. If ablate_direction is given (pre-constructed
+    unit vector of correct dtype/device), uses that for null-space projection.
+    """
     ids = tokenizer.encode(format_prompt(tokenizer, stimulus['user_prompt']),
                            return_tensors='pt').to(get_device(model))
     ther_toks = tokenizer.encode(stimulus['therapeutic_completion'],
@@ -2045,7 +2066,12 @@ def logit_diff_measure(stimulus, ablate_layer=None):
                                  add_special_tokens=False)[:3]
     handles = []
     if ablate_layer is not None:
-        v = dir_clinical[ablate_layer].to(device=get_device(model), dtype=next(model.parameters()).dtype)
+        if ablate_direction is None:
+            v = dir_clinical[ablate_layer].to(
+                device=get_device(model),
+                dtype=next(model.parameters()).dtype)
+        else:
+            v = ablate_direction
         def make_hook(v=v):
             def fn(mod, inp, out):
                 h = out[0] if isinstance(out, tuple) else out
@@ -2070,50 +2096,106 @@ patch_stim = test_stimuli[:n_patch]
 baselines_patch = [logit_diff_measure(s) for s in patch_stim]
 print(f'Baseline mean logit_diff: {np.mean(baselines_patch):+.3f}')
 
+# Main ablation: dir_clinical at each layer
 causal_effects = {l: [] for l in LAYERS}
+# Control 1: random unit vectors (same norm) — any causal claim must exceed this null
+control_random = {l: [] for l in LAYERS}
+# Control 2: dir_empathy (therapeutic vs cold) — tests clinical-sycophancy SPECIFICITY
+# If ablating the empathy direction produces the same effect as clinical, our
+# direction isn't uniquely capturing sycophancy.
+control_empathy = {l: [] for l in LAYERS}
+
+device = get_device(model)
+dtype = next(model.parameters()).dtype
+_rng_torch = torch.Generator().manual_seed(42)
+random_dirs = {l: F.normalize(torch.randn(dir_clinical[l].shape, generator=_rng_torch), dim=0).to(device=device, dtype=dtype)
+               for l in LAYERS}
+
 for i, s in enumerate(tqdm(patch_stim, desc='Causal patch')):
     b = baselines_patch[i]
     for l in LAYERS:
+        # Main: ablate dir_clinical
         causal_effects[l].append(logit_diff_measure(s, ablate_layer=l) - b)
+        # Control 1: ablate random unit direction of equal norm
+        control_random[l].append(logit_diff_measure(
+            s, ablate_layer=l, ablate_direction=random_dirs[l]) - b)
+        # Control 2: ablate empathy direction at same layer
+        if l in dir_empathy:
+            emp_v = dir_empathy[l].to(device=device, dtype=dtype)
+            control_empathy[l].append(logit_diff_measure(
+                s, ablate_layer=l, ablate_direction=emp_v) - b)
+        else:
+            control_empathy[l].append(float('nan'))
     if (i + 1) % 3 == 0:
         cleanup()
 
-causal_per_layer = {}
-print(f'\n  Per-layer causal effect (null-space project dir_clinical[L]):')
-print(f'  {"Layer":>6}  {"Mean Δ":>10}  {"SEM":>8}  {"95% CI":>20}  {"p":>8}  sig')
-for l in LAYERS:
-    vals = np.array(causal_effects[l])
-    mean = float(np.mean(vals))
-    sem = float(np.std(vals, ddof=1) / np.sqrt(len(vals))) if len(vals) > 1 else 0
-    rng = np.random.RandomState(42)
-    boots = [rng.choice(vals, len(vals), replace=True).mean() for _ in range(2000)]
-    lo, hi = np.percentile(boots, [2.5, 97.5])
-    t_stat, p_val = scipy_stats.ttest_1samp(vals, 0)
-    sig = '***' if p_val < 0.001 else '**' if p_val < 0.01 else '*' if p_val < 0.05 else ''
-    causal_per_layer[str(l)] = {
-        'mean': mean, 'sem': sem,
-        'ci_lo': float(lo), 'ci_hi': float(hi),
-        'p_value': float(p_val), 't_stat': float(t_stat),
-    }
-    print(f'  {l:>6}  {mean:>+9.3f}  {sem:>+7.3f}  [{lo:+.2f}, {hi:+.2f}]  {p_val:>7.4f} {sig}')
+def _summarize(effects_by_layer):
+    """Compute per-layer mean, SEM, bootstrap CI, and paired-t vs 0."""
+    out = {}
+    for l in LAYERS:
+        vals = np.array([v for v in effects_by_layer[l] if not np.isnan(v)])
+        if len(vals) < 2:
+            out[str(l)] = {'mean': 0, 'sem': 0, 'ci_lo': 0, 'ci_hi': 0,
+                            'p_value': 1.0, 't_stat': 0.0}
+            continue
+        mean = float(np.mean(vals))
+        sem = float(np.std(vals, ddof=1) / np.sqrt(len(vals)))
+        rng = np.random.RandomState(42)
+        boots = [rng.choice(vals, len(vals), replace=True).mean() for _ in range(2000)]
+        lo, hi = np.percentile(boots, [2.5, 97.5])
+        t_stat, p_val = scipy_stats.ttest_1samp(vals, 0)
+        out[str(l)] = {'mean': mean, 'sem': sem,
+                        'ci_lo': float(lo), 'ci_hi': float(hi),
+                        'p_value': float(p_val), 't_stat': float(t_stat)}
+    return out
 
-fig, ax = plt.subplots(figsize=(8, 4))
+causal_per_layer = _summarize(causal_effects)
+control_random_per_layer = _summarize(control_random)
+control_empathy_per_layer = _summarize(control_empathy)
+
+# Paired test: is dir_clinical effect GREATER than the random-vector control?
+# This is the specificity test for the causal claim.
+print(f'\n  Per-layer ablation effect (clinical vs random vs empathy controls):')
+print(f'  {"Layer":>6}  {"Clin Δ":>9}  {"Rand Δ":>9}  {"Emp Δ":>9}  {"Clin vs Rand p":>14}')
+causal_vs_random_p = {}
+for l in LAYERS:
+    clin_vals = np.array([v for v in causal_effects[l] if not np.isnan(v)])
+    rand_vals = np.array([v for v in control_random[l] if not np.isnan(v)])
+    # Paired t-test: per-item difference
+    diffs = clin_vals - rand_vals
+    t_stat, p_val = scipy_stats.ttest_1samp(diffs, 0) if len(diffs) > 1 else (0.0, 1.0)
+    causal_vs_random_p[str(l)] = {'t_stat': float(t_stat), 'p_value': float(p_val)}
+    emp_mean = float(np.mean([v for v in control_empathy[l] if not np.isnan(v)])) if control_empathy[l] else float('nan')
+    sig = '***' if p_val < 0.001 else '**' if p_val < 0.01 else '*' if p_val < 0.05 else ''
+    print(f'  {l:>6}  {causal_per_layer[str(l)]["mean"]:>+8.3f}  '
+          f'{control_random_per_layer[str(l)]["mean"]:>+8.3f}  '
+          f'{emp_mean:>+8.3f}  '
+          f'{p_val:>13.4f} {sig}')
+
+fig, ax = plt.subplots(figsize=(9, 5))
 xs = list(LAYERS)
-means = [causal_per_layer[str(l)]['mean'] for l in xs]
-los = [causal_per_layer[str(l)]['ci_lo'] for l in xs]
-his = [causal_per_layer[str(l)]['ci_hi'] for l in xs]
-ax.plot(xs, means, 'o-', color=RED, lw=1.5, markersize=6)
-ax.fill_between(xs, los, his, color=RED, alpha=0.2)
-ax.axhline(0, color='gray', ls=':', alpha=0.4)
+for label, summary, color, marker in [
+    ('dir_clinical (main)', causal_per_layer, RED, 'o'),
+    ('random control', control_random_per_layer, GRAY, 's'),
+    ('dir_empathy control', control_empathy_per_layer, BLUE, '^'),
+]:
+    means = [summary[str(l)]['mean'] for l in xs]
+    los = [summary[str(l)]['ci_lo'] for l in xs]
+    his = [summary[str(l)]['ci_hi'] for l in xs]
+    ax.plot(xs, means, f'{marker}-', color=color, lw=1.3, markersize=6, label=label)
+    ax.fill_between(xs, los, his, color=color, alpha=0.15)
+ax.axhline(0, color='black', ls=':', alpha=0.5)
+# Annotate where clin vs random is significant (p < 0.05 paired t-test)
 for l in xs:
-    p = causal_per_layer[str(l)]['p_value']
+    p = causal_vs_random_p[str(l)]['p_value']
     if p < 0.05:
         mark = '*' if p >= 0.01 else '**' if p >= 0.001 else '***'
         ax.text(l, causal_per_layer[str(l)]['ci_hi'] + 0.05, mark,
-                ha='center', fontsize=12, fontweight='bold')
-ax.set(xlabel='Layer ablated (null-space projection of dir_clinical[L])',
+                ha='center', fontsize=11, fontweight='bold', color=RED)
+ax.set(xlabel='Layer ablated (null-space projection)',
        ylabel='Δ logit_diff  (therapeutic − sycophantic)',
-       title='Causal direction-ablation: per-layer mediation (95% bootstrap CI)')
+       title='Causal direction-ablation vs controls (95% CI; * = clin vs random paired p<0.05)')
+ax.legend(fontsize=9)
 fig.tight_layout()
 plt.savefig('plots/fig11_causal_patching.png', dpi=150, bbox_inches='tight'); plt.close()
 
@@ -2282,8 +2364,12 @@ results = {
         'intervention_specificity': specificity_summary,
         'causal_direction_ablation': {
             'per_layer': causal_per_layer,
+            'per_layer_random_control': control_random_per_layer,
+            'per_layer_empathy_control': control_empathy_per_layer,
+            'clinical_vs_random_paired_t': causal_vs_random_p,
             'baseline_mean_logit_diff': float(np.mean(baselines_patch)),
             'method': 'null-space projection at specified layer, all positions',
+            'specificity_controls': 'random unit vector (matched norm) + dir_empathy',
             'n_stimuli': n_patch,
         },
     },
