@@ -511,7 +511,7 @@ print('\n' + '=' * 70)
 print('GEOMETRY OF THE CLINICAL SYCOPHANCY SUBSPACE')
 print('=' * 70)
 
-# --- Plot A: per-item projection distributions (violin + bootstrap CI on means)
+# Plot A: per-item projection distributions (violin + bootstrap CI on means)
 # Preregistered layer for cleaner distribution visualization
 sorted_by_cos = sorted(subcat_results.items(),
                        key=lambda x: -x[1]['cos_with_clinical'])
@@ -558,7 +558,7 @@ fig.tight_layout()
 plt.savefig('plots/fig12_subspace_item_distributions.png',
             dpi=150, bbox_inches='tight'); plt.close()
 
-# --- Plot B: per-layer heatmap (subtype × layer)
+# Plot B: per-layer heatmap (subtype × layer)
 fig, ax = plt.subplots(figsize=(11, 6))
 mat = np.array([[subcat_results[s]['cos_per_layer'][l] for l in LAYERS]
                 for s in sub_names])
@@ -584,7 +584,7 @@ fig.tight_layout()
 plt.savefig('plots/fig13_subspace_heatmap.png',
             dpi=150, bbox_inches='tight'); plt.close()
 
-# --- Plot C: pairwise subtype-direction cosine matrix at preregistered layer
+# Plot C: pairwise subtype-direction cosine matrix at preregistered layer
 n_sub = len(sub_names)
 pairwise = np.zeros((n_sub, n_sub))
 for i, a in enumerate(sub_names):
